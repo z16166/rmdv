@@ -4964,6 +4964,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "open",
  "pulldown-cmark 0.12.2",
+ "raw-window-handle",
  "reqwest 0.12.28",
  "resvg",
  "serde",
@@ -4988,6 +4989,7 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

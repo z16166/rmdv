@@ -206,6 +206,8 @@ impl App {
                             recently_scrolled,
                             crate::render::ReadingWidth::Fill,
                             self.copy_flash.map(|(_, key)| key),
+                            self.font_family.as_deref(),
+                            self.font_family_cjk,
                         )
                         .map(|message| Self::full_mindmap_preview_message(message, path, blocks));
                         let mut preview = Column::new().push(rendered);

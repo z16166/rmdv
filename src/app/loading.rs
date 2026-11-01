@@ -20,6 +20,20 @@ pub(super) async fn load_file(p: PathBuf) -> Result<(PathBuf, String), String> {
     Ok((p, document_text(bytes)))
 }
 
+/// Synchronously read a non-PDF document for the initial launch frame, so
+/// the first `view()` already renders the file instead of flashing the
+/// welcome card. PDF files still use the async path (pdfium is heavy and
+/// process-global). A single markdown read is fast and runs on the app's
+/// init thread before the window paints.
+pub(super) fn load_file_sync(p: &Path) -> Result<(PathBuf, String), String> {
+    let p = canonicalize_existing_path(p.to_path_buf());
+    let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(too_large_message(bytes.len() as u64));
+    }
+    Ok((p, document_text(bytes)))
+}
+
 /// Largest document the main viewer will read. Files past this are refused
 /// before reading instead of being pulled whole into memory.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;

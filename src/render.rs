@@ -19,6 +19,48 @@ pub fn block_anchor_id(id: BlockId) -> iced::widget::Id {
     iced::widget::Id::from(format!("block-anchor-{}", id.0))
 }
 
+// The body font selected by the user (Settings → Font). Set at the top of
+// `render` and read by `make_span` so the chosen typeface applies to every
+// body text span without plumbing a parameter through the whole render
+// pipeline. Rendering runs on the UI thread only, so a thread-local is safe.
+// `None` uses the bundled Inter.
+std::thread_local! {
+    static BODY_FONT: std::cell::Cell<Option<iced::Font>> = const { std::cell::Cell::new(None) };
+    /// Whether the chosen body font covers CJK glyphs itself (computed off
+    /// the UI thread by [`crate::fonts::family_covers_cjk`]). When it does,
+    /// `make_span` lets CJK runs keep it instead of the bundled CJK face.
+    static BODY_FONT_CJK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // `iced::Font::with_name` needs a `&'static str`, so family names are
+    // leaked; caching them keeps `render` from leaking a new String per frame.
+    static BODY_FONT_NAMES: std::cell::RefCell<Vec<&'static str>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+fn cached_font_name(name: &str) -> &'static str {
+    BODY_FONT_NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some(&cached) = names.iter().find(|&&n| n == name) {
+            return cached;
+        }
+        let leaked: &'static str = name.to_string().leak();
+        names.push(leaked);
+        leaked
+    })
+}
+
+/// The body text font: the user's choice, or the bundled Inter. CJK glyphs
+/// fall back to the bundled Noto Sans TC automatically because cosmic-text
+/// shapes across all loaded faces.
+fn body_font() -> iced::Font {
+    BODY_FONT.with(|f| f.get().unwrap_or_else(|| iced::Font::with_name("Inter")))
+}
+
+/// Whether the chosen body font covers CJK itself; CJK runs then keep it
+/// instead of the bundled Noto Sans TC.
+fn body_font_covers_cjk() -> bool {
+    BODY_FONT_CJK.with(|f| f.get())
+}
+
 #[derive(Clone, Default)]
 pub struct Highlight {
     pub query: String,
@@ -61,7 +103,17 @@ pub fn render<'a>(
     recently_scrolled: bool,
     reading_width: ReadingWidth,
     copied: Option<usize>,
+    font_family: Option<&str>,
+    font_family_cjk: bool,
 ) -> Element<'a, Message> {
+    // Publish the chosen body font for `make_span` to read. A thread-local
+    // avoids plumbing it through every block/inline helper; rendering is
+    // single-threaded on the UI thread. Family names are leaked into
+    // `&'static str`s because `iced::Font::with_name` requires one; the
+    // cache bounds the leak to one String per distinct family.
+    let font = font_family.map(|name| iced::Font::with_name(cached_font_name(name)));
+    BODY_FONT.with(|f| f.set(font));
+    BODY_FONT_CJK.with(|f| f.set(font_family_cjk));
     let img_ctx = ImgCtx {
         cache: image_cache,
         current_file,
@@ -911,13 +963,15 @@ fn make_span<'a>(
     bg: Option<iced::Color>,
 ) -> RtSpan<'a> {
     let mut font = if narrow {
+        // Half-width punctuation is a layout feature, not a font choice:
+        // it stays in the punct face whichever family the user picked.
         iced::Font::with_name(crate::fonts::PUNCT_FAMILY)
-    } else if cjk {
+    } else if cjk && !(!code && body_font_covers_cjk()) {
         iced::Font::with_name(crate::fonts::CJK_FAMILY)
     } else if code {
         iced::Font::MONOSPACE
     } else {
-        iced::Font::with_name("Inter")
+        body_font()
     };
     // CJK fonts generally do not ship italic faces. Asking cosmic-text for
     // one prevents it from selecting the normal CJK fallback face, so keep

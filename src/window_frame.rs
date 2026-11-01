@@ -6,6 +6,14 @@
 //! the main screen (the one with the menu bar) and y growing down. These are
 //! the coordinates Winit reports in `Moved` and takes in a specific launch
 //! position, on every platform.
+//!
+//! On Windows `GetMonitorInfoW` reports work areas in physical pixels, and a
+//! monitor's scale is its effective DPI divided by 96 (so a 200 % display has
+//! scale 2.0). [`visible_screens`] divides each physical work area by that
+//! scale before returning it, which keeps the saved logical frame comparable
+//! to the screen list: a frame saved on a 200 % monitor restores to the same
+//! logical spot, and a frame from a 100 % monitor is clamped against the
+//! logical (not physical) bounds of a 200 % one.
 
 use serde::{Deserialize, Serialize};
 
@@ -251,9 +259,109 @@ pub fn visible_screens() -> Option<Vec<ScreenRect>> {
     )
 }
 
+/// The visible area of every screen, the main screen first, read from the
+/// Win32 display API. Coordinates are converted from the physical pixels
+/// `GetMonitorInfoW` reports to the logical points Winit uses (and this
+/// module stores): each monitor's work area is divided by its effective
+/// DPI scale. The primary monitor is placed first so a saved frame with no
+/// position centers on it.
+#[cfg(windows)]
+pub fn visible_screens() -> Option<Vec<ScreenRect>> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows_sys::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+
+    unsafe extern "system" fn collect_monitor(
+        hmonitor: HMONITOR,
+        _hdc: HDC,
+        _lprc: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        // Safety: `lparam` is a pointer to a live `Vec<HMONITOR>` owned by
+        // the caller for the duration of `EnumDisplayMonitors`.
+        let monitors = &mut *(lparam as *mut Vec<HMONITOR>);
+        monitors.push(hmonitor);
+        1 // TRUE: continue enumeration.
+    }
+
+    let mut monitors: Vec<HMONITOR> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            0,
+            std::ptr::null(),
+            Some(collect_monitor),
+            &mut monitors as *mut Vec<HMONITOR> as LPARAM,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let mut screens: Vec<(bool, ScreenRect)> = Vec::new();
+    for hmonitor in monitors {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            rcWork: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            dwFlags: 0,
+        };
+        if unsafe { GetMonitorInfoW(hmonitor, &mut info) } == 0 {
+            continue;
+        }
+        // S_OK is 0; any failure (e.g. the monitor vanished) falls back to
+        // a scale of 1.0 so the frame is still clamped to physical bounds.
+        let scale = {
+            let mut dpi_x = 0u32;
+            let mut dpi_y = 0u32;
+            let hr =
+                unsafe { GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+            if hr == 0 && dpi_x > 0 {
+                dpi_x as f32 / 96.0
+            } else {
+                1.0
+            }
+        };
+        let work = info.rcWork;
+        let width = (work.right - work.left) as f32 / scale;
+        let height = (work.bottom - work.top) as f32 / scale;
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        screens.push((
+            info.dwFlags & MONITORINFOF_PRIMARY != 0,
+            ScreenRect {
+                x: work.left as f32 / scale,
+                y: work.top as f32 / scale,
+                width,
+                height,
+            },
+        ));
+    }
+
+    if screens.is_empty() {
+        return None;
+    }
+    // Primary monitor first; keep the API's order otherwise.
+    screens.sort_by(|a, b| b.0.cmp(&a.0));
+    Some(screens.into_iter().map(|(_, s)| s).collect())
+}
+
 /// No screen list before the window opens on this platform: a restored
 /// window keeps its size and is centered.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn visible_screens() -> Option<Vec<ScreenRect>> {
     None
 }

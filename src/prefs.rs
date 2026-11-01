@@ -36,6 +36,16 @@ pub struct Prefs {
     /// 1200 px on a 4K display at 200% scaling; `Full` follows the window.
     #[serde(default, deserialize_with = "lenient_reading_width")]
     pub reading_width: crate::theme::ReadingWidth,
+    /// The reader's body font family. `None` uses the bundled Inter. A
+    /// missing, empty, or non-string value falls back to `None`; a name
+    /// that is not installed falls back at render time to Inter (with the
+    /// bundled Noto Sans TC for CJK).
+    #[serde(
+        default,
+        deserialize_with = "lenient_font_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub font_family: Option<String>,
     /// Show dot files and folders in the sidebar (⌘⇧.).
     #[serde(default)]
     pub show_hidden: bool,
@@ -240,6 +250,19 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
+/// A missing, null, empty, or non-string font family falls back to `None`
+/// (the bundled Inter) instead of failing the whole file.
+fn lenient_font_family<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value.as_str() {
+        Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    })
+}
+
 /// An unknown glass mode (e.g. from a newer build) turns glass off instead of
 /// failing the whole file.
 fn lenient_glass<'de, D>(deserializer: D) -> Result<crate::macos_vibrancy::Glass, D::Error>
@@ -314,6 +337,7 @@ impl Default for Prefs {
             font_scale: default_font_scale(),
             line_spacing: crate::theme::LineSpacing::Default,
             reading_width: crate::theme::ReadingWidth::default(),
+            font_family: None,
             show_hidden: false,
             mindmap_autocenter: true,
             mindmap_scroll_pans: false,
@@ -499,6 +523,47 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains(r#""reading_width":"1440""#), "{json}");
+    }
+
+    #[test]
+    fn font_family_defaults_to_none_and_survives_bad_values() {
+        // A prefs file from before the setting existed: no font override.
+        let prefs: Prefs = serde_json::from_str(r#"{"show_footer":false}"#).unwrap();
+        assert_eq!(prefs.font_family, None);
+        assert_eq!(Prefs::default().font_family, None);
+        // A saved choice loads as saved (trimmed).
+        let prefs: Prefs = serde_json::from_str(r#"{"font_family":"Segoe UI"}"#).unwrap();
+        assert_eq!(prefs.font_family.as_deref(), Some("Segoe UI"));
+        let prefs: Prefs = serde_json::from_str(r#"{"font_family":"  Arial  "}"#).unwrap();
+        assert_eq!(prefs.font_family.as_deref(), Some("Arial"));
+        // Missing, null, empty, and non-string values fall back to None
+        // without failing the whole file.
+        let cases: [(&str, &str); 7] = [
+            ("null", "null"),
+            ("empty", "\"\""),
+            ("spaces", "\"   \""),
+            ("number", "42"),
+            ("bool", "true"),
+            ("array", "[]"),
+            ("object", "{}"),
+        ];
+        for (label, bad) in cases {
+            let json = format!(r#"{{"font_family":{bad},"show_footer":false}}"#);
+            let prefs: Prefs =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{label} ({json}): {e}"));
+            assert_eq!(prefs.font_family, None, "{label}");
+            assert!(!prefs.show_footer, "{label}");
+        }
+        // None is not written; a choice round-trips.
+        let json = serde_json::to_string(&Prefs::default()).unwrap();
+        assert!(!json.contains(r#""font_family":"#), "{json}");
+        let json = serde_json::to_string(&Prefs {
+            font_family: Some("Segoe UI".into()),
+            ..Prefs::default()
+        })
+        .unwrap();
+        let prefs: Prefs = serde_json::from_str(&json).unwrap();
+        assert_eq!(prefs.font_family.as_deref(), Some("Segoe UI"));
     }
 
     #[test]

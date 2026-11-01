@@ -218,6 +218,18 @@ pub struct App {
     /// Main document column width (Settings → Reading width). Applies to the
     /// reader, the Raw/Zen editors, and previews alike.
     pub reading_width: theme::ReadingWidth,
+    /// The reader's body font family (Settings → Font). `None` uses the
+    /// bundled Inter. The chosen name is validated against `fonts` when the
+    /// list is loaded; an uninstalled name falls back to Inter.
+    pub font_family: Option<String>,
+    /// Whether `font_family` covers CJK glyphs with its own faces (computed
+    /// off the UI thread by [`crate::fonts::family_covers_cjk`]). While true,
+    /// the reader lets CJK runs keep the chosen family instead of pinning
+    /// them to the bundled Noto Sans TC.
+    pub font_family_cjk: bool,
+    /// OS font families loaded in the background when Settings first opens.
+    /// `None` while the list is still loading.
+    pub fonts: Option<Vec<String>>,
     pub show_footer: bool,
     pub error: Option<String>,
     /// The file or folder the error card's Reveal in Finder shows, with the
@@ -367,6 +379,13 @@ pub struct App {
     /// Whether the frame's settle timer is in flight. A burst of moves and
     /// resizes shares that one timer.
     pub window_frame_settle_armed: bool,
+    /// Whether the launch window has been shown. On Windows it starts hidden
+    /// (`window_settings`) and the first presented frame reveals it.
+    pub window_revealed: bool,
+    /// Whether the one-shot reveal fallback timer is in flight; it shows the
+    /// window even if no frame is ever presented (a hidden window may never
+    /// get a paint request).
+    pub window_reveal_fallback_armed: bool,
     pub overlay_viewport: Option<iced::widget::scrollable::Viewport>,
     pub body_viewport: Option<iced::widget::scrollable::Viewport>,
     pub last_body_range: std::cell::Cell<(usize, usize)>,
@@ -671,6 +690,9 @@ impl Default for App {
             font_scale,
             line_spacing: prefs.line_spacing,
             reading_width: prefs.reading_width,
+            font_family: prefs.font_family.clone(),
+            font_family_cjk: false,
+            fonts: None,
             show_footer: prefs.show_footer,
             error: None,
             error_path: None,
@@ -734,9 +756,14 @@ impl Default for App {
             window_mode_last_trigger: None,
             window_mode_settle_armed: false,
             window_position: None,
-            window_maximized: false,
+            // The launch window is created with the saved maximized state;
+            // the flag starts in sync so the monitor fit below leaves a
+            // maximized window alone.
+            window_maximized: prefs.window.map(|frame| frame.maximized).unwrap_or(false),
             window_frame_changed_at: None,
             window_frame_settle_armed: false,
+            window_revealed: !cfg!(target_os = "windows"),
+            window_reveal_fallback_armed: false,
             overlay_viewport: None,
             body_viewport: None,
             last_body_range: std::cell::Cell::new((0, 0)),
@@ -2236,8 +2263,24 @@ impl App {
             Some(p) => {
                 if p.is_dir() {
                     Task::done(Message::OpenWorkspace(p))
-                } else {
+                } else if is_pdf_path(Some(&p)) {
+                    // PDF extraction needs pdfium (heavy, process-global); keep
+                    // the async path. The first frame shows the welcome card
+                    // briefly until extraction finishes.
                     app.begin_generic_file_load(p)
+                } else {
+                    // Load the initial document synchronously so the first
+                    // `view()` already renders it instead of flashing the
+                    // welcome card (which looks like a folder picker) for
+                    // hundreds of milliseconds. A single markdown read runs
+                    // on the app's init thread before the window paints.
+                    match load_file_sync(&p) {
+                        Ok((path, src)) => app.apply_loaded_file(path, src),
+                        Err(error) => {
+                            app.set_error_for(error, p);
+                            Task::none()
+                        }
+                    }
                 }
             }
             None => Task::none(),
@@ -2254,7 +2297,22 @@ impl App {
             } else {
                 Task::none()
             };
-        (app, Task::batch([task, update_check, cli_prompt]))
+        // A saved body font's CJK coverage is probed off the UI thread; until
+        // it answers, CJK runs keep the bundled Noto Sans TC fallback.
+        let font_cjk_check = match app.font_family.clone() {
+            Some(name) => Task::perform(
+                async move {
+                    let covered = crate::fonts::family_covers_cjk(&name);
+                    (name, covered)
+                },
+                |(family, covered)| Message::FontCjkCoverage(family, covered),
+            ),
+            None => Task::none(),
+        };
+        (
+            app,
+            Task::batch([task, update_check, cli_prompt, font_cjk_check]),
+        )
     }
 
     /// Returns the next theme in cycle order: all built-in presets followed
@@ -3112,6 +3170,8 @@ impl App {
                         recently_scrolled,
                         crate::render::ReadingWidth::Fill,
                         self.copy_flash.map(|(_, key)| key),
+                        self.font_family.as_deref(),
+                        self.font_family_cjk,
                     ));
                     if truncated {
                         col = col.push(
@@ -3533,6 +3593,19 @@ impl App {
             iced::window::Event::Resized(size) => Some(Message::WindowResized(id, size)),
             _ => None,
         });
+        // Windows: the launch window is hidden; its first presented frame
+        // reveals it, so the white frame flash before it never appears. The
+        // reveal flips `window_revealed`, and this subscription is dropped on
+        // the next pass. (Kept apart from `window_events`: `filter_map`
+        // requires a zero-sized, non-capturing closure.)
+        let window_first_frame = if self.window_revealed {
+            iced::Subscription::none()
+        } else {
+            iced::window::events().filter_map(|(id, event)| match event {
+                iced::window::Event::RedrawRequested(_) => Some(Message::WindowFirstFrame(id)),
+                _ => None,
+            })
+        };
         // A click anywhere, including the start of a new drag, ends a
         // whole-document selection.
         let select_all_clear = if self.select_all_clear_listens() {
@@ -3553,6 +3626,7 @@ impl App {
             mind_drag,
             full_mind_drag,
             window_events,
+            window_first_frame,
             ipc,
             native_pinch,
             native_swipe,
@@ -3577,19 +3651,10 @@ impl App {
                     }
                 });
             }
-            // Deferred from main(): first view pays ~270ms font scan instead of blocking window paint.
-            static FONTS_LOADED: OnceLock<()> = OnceLock::new();
-            FONTS_LOADED.get_or_init(|| {
-                let fs = iced::advanced::graphics::text::font_system();
-                if let Ok(mut guard) = fs.write() {
-                    guard.raw().db_mut().load_system_fonts();
-                }
-                if std::env::var_os("RMDV_BENCH_STARTUP").is_some() {
-                    if let Some(d) = crate::bench::since_process_start() {
-                        eprintln!("startup: fonts_loaded={:?}", d);
-                    }
-                }
-            });
+            // Deferred from main(): first view pays ~270ms font scan instead of
+            // blocking window paint. Shared with the background CJK coverage
+            // probe so the system font scan runs once.
+            crate::fonts::ensure_system_fonts_loaded();
         }
         let pal = self.view_palette();
         let reader_ground = self.reader_ground();
@@ -3830,6 +3895,8 @@ impl App {
                         recently_scrolled,
                         self.doc_reading_width(),
                         self.copy_flash.map(|(_, key)| key),
+                        self.font_family.as_deref(),
+                        self.font_family_cjk,
                     )
                 }
             } else {
@@ -3850,6 +3917,8 @@ impl App {
                     recently_scrolled,
                     self.doc_reading_width(),
                     self.copy_flash.map(|(_, key)| key),
+                    self.font_family.as_deref(),
+                    self.font_family_cjk,
                 )
             };
             if self.view_mode == ViewMode::Raw || self.view_mode == ViewMode::Mindmap {

@@ -2373,8 +2373,10 @@ impl App {
                 }
                 let monitor = iced::window::monitor_size(id)
                     .map(move |monitor| Message::WindowMonitorSize(id, monitor));
-                Task::batch([mode, monitor])
+                Task::batch([mode, monitor, self.arm_window_reveal_fallback(id)])
             }
+            Message::WindowFirstFrame(id) => self.reveal_window_if_needed(id),
+            Message::WindowRevealFallback(id) => self.reveal_window_if_needed(id),
             Message::RefreshWindowModeSettled(id) => self.window_mode_settle_fired(id),
             Message::WindowModeChanged(mode) => {
                 self.window_fullscreen = matches!(mode, iced::window::Mode::Fullscreen);
@@ -2819,6 +2821,29 @@ impl App {
                 iced::widget::operation::focus(Self::picker_path_input_id())
             }
             Message::SetReadingWidth(width) => self.set_reading_width(width),
+            Message::SetFontFamily(family) => self.set_font_family(family),
+            Message::FontsLoaded(fonts) => {
+                self.fonts = Some(fonts);
+                // If the saved family is not in the loaded list, drop back to
+                // Inter so the reader never renders tofu for an uninstalled
+                // choice. The pref is not rewritten until the user picks.
+                if let Some(saved) = &self.font_family {
+                    if !self
+                        .fonts
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .any(|f| f == saved)
+                    {
+                        self.font_family = None;
+                        self.font_family_cjk = false;
+                    }
+                }
+                Task::none()
+            }
+            Message::FontCjkCoverage(family, covered) => {
+                self.apply_font_family_cjk(family, covered)
+            }
             Message::PickerPointerPress { double } => {
                 // Any press consumes the last row click. Only the press that
                 // completes a double-click on the folder that click

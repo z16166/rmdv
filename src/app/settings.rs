@@ -14,6 +14,7 @@ pub enum SettingsRow {
     FontSize,
     LineSpacing,
     ReadingWidth,
+    Font,
     Toolbar,
     Footer,
     HiddenFiles,
@@ -38,6 +39,7 @@ impl SettingsRow {
             FontSize,
             LineSpacing,
             ReadingWidth,
+            Font,
             Toolbar,
             Footer,
             HiddenFiles,
@@ -97,10 +99,22 @@ impl App {
         self.picker = None;
         self.settings_open = true;
         self.settings_cursor = 0;
-        iced::widget::operation::snap_to(
+        let snap = iced::widget::operation::snap_to(
             Self::settings_scroll_id(),
             iced::widget::scrollable::RelativeOffset::START,
-        )
+        );
+        // Enumerate OS fonts in the background the first time Settings
+        // opens. The list is never read on the startup path, so it cannot
+        // slow the first frame.
+        if self.fonts.is_none() {
+            let load = Task::perform(
+                async { crate::fonts::list_families() },
+                Message::FontsLoaded,
+            );
+            Task::batch([snap, load])
+        } else {
+            snap
+        }
     }
 
     pub(super) fn settings_move(&mut self, delta: i32) -> Task<Message> {
@@ -123,6 +137,7 @@ impl App {
             SettingsRow::FontSize => Message::FontSizeReset,
             SettingsRow::LineSpacing => Message::SetLineSpacing(crate::theme::LineSpacing::Default),
             SettingsRow::ReadingWidth => Message::SetReadingWidth(self.reading_width.step(1)),
+            SettingsRow::Font => Message::SetFontFamily(None),
             SettingsRow::Toolbar => Message::SetToolbarMode(self.prefs.toolbar.toggled()),
             SettingsRow::Footer => Message::ToggleFooter,
             SettingsRow::HiddenFiles => Message::ToggleHidden,
@@ -176,6 +191,31 @@ impl App {
             SettingsRow::ReadingWidth => {
                 let next = self.reading_width.step(dir);
                 (next != self.reading_width).then_some(Message::SetReadingWidth(next))
+            }
+            SettingsRow::Font => {
+                let fonts = self.fonts.as_deref().unwrap_or(&[]);
+                if fonts.is_empty() {
+                    None
+                } else {
+                    let current = self
+                        .font_family
+                        .as_deref()
+                        .and_then(|f| fonts.iter().position(|name| name == f));
+                    let next = match current {
+                        Some(idx) => {
+                            let n = fonts.len() as i64;
+                            ((idx as i64 + i64::from(dir.signum())).rem_euclid(n)) as usize
+                        }
+                        None => {
+                            if dir > 0 {
+                                0
+                            } else {
+                                fonts.len() - 1
+                            }
+                        }
+                    };
+                    Some(Message::SetFontFamily(Some(fonts[next].clone())))
+                }
             }
             SettingsRow::Toolbar => {
                 let next = if forward {
@@ -241,6 +281,61 @@ impl App {
         self.save_prefs();
         // The reader, editors, and previews share this cap; widths that
         // change the wrapped text invalidate measured block heights.
+        self.height_cache.clear();
+        self.rebuild_virt_here();
+        let preview_measure = self.refresh_full_mindmap_preview_heights();
+        Task::batch([self.measure_window_heights(), preview_measure])
+    }
+
+    pub(super) fn set_font_family(&mut self, family: Option<String>) -> Task<Message> {
+        // Validate against the loaded list when available: an uninstalled
+        // name would render as the fallback anyway, so reject it early and
+        // keep the previous choice. `None` (Inter) is always valid.
+        if let Some(name) = &family {
+            if let Some(fonts) = &self.fonts {
+                if !fonts.iter().any(|f| f == name) {
+                    return self.show_toast(format!("“{name}” is not installed"));
+                }
+            }
+        }
+        if self.font_family == family {
+            return Task::none();
+        }
+        self.font_family = family.clone();
+        self.prefs.font_family = family.clone();
+        self.save_prefs();
+        // Until the coverage probe answers, CJK runs fall back to the bundled
+        // Noto Sans TC rather than risking tofu in the new family.
+        self.font_family_cjk = false;
+        // A different typeface changes every measured block height.
+        self.height_cache.clear();
+        self.rebuild_virt_here();
+        let preview_measure = self.refresh_full_mindmap_preview_heights();
+        let coverage = match family {
+            Some(name) => Task::perform(
+                async move {
+                    let covered = crate::fonts::family_covers_cjk(&name);
+                    (name, covered)
+                },
+                |(family, covered)| Message::FontCjkCoverage(family, covered),
+            ),
+            None => Task::none(),
+        };
+        Task::batch([self.measure_window_heights(), preview_measure, coverage])
+    }
+
+    /// Apply the background CJK-coverage verdict for `family`. A stale answer
+    /// (the user picked another font meanwhile) is dropped.
+    pub(super) fn apply_font_family_cjk(&mut self, family: String, covered: bool) -> Task<Message> {
+        if self.font_family.as_deref() != Some(family.as_str()) {
+            return Task::none();
+        }
+        if self.font_family_cjk == covered {
+            return Task::none();
+        }
+        self.font_family_cjk = covered;
+        // Coverage changes which face CJK runs use, so every measured block
+        // height is stale.
         self.height_cache.clear();
         self.rebuild_virt_here();
         let preview_measure = self.refresh_full_mindmap_preview_heights();

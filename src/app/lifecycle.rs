@@ -24,6 +24,11 @@ pub fn window_settings(transparent: bool) -> iced::window::Settings {
         min_size: Some(WINDOW_MIN_SIZE),
         // The app decides: unsaved edits ask before the window closes.
         exit_on_close_request: false,
+        // Windows: open hidden; the first presented frame shows the window,
+        // so the white frame flash before it never appears (see
+        // `reveal_window`).
+        #[cfg(target_os = "windows")]
+        visible: false,
         ..Default::default()
     }
 }
@@ -31,6 +36,12 @@ pub fn window_settings(transparent: bool) -> iced::window::Settings {
 /// How long the window must stay still before its frame is saved: one
 /// prefs write per resize or move, not one per event.
 pub(super) const WINDOW_FRAME_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a hidden launch window (Windows) waits for its first presented
+/// frame before the fallback shows it anyway. A hidden window may never get
+/// a paint request, so the reveal cannot rely on the frame alone.
+#[cfg(target_os = "windows")]
+const WINDOW_REVEAL_FALLBACK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What the frame's settle timer does when it fires `since` after the
 /// latest move or resize: `None` samples and saves now, `Some(wait)` fires
@@ -61,10 +72,12 @@ fn sample_window_frame(id: iced::window::Id) -> Task<Message> {
     })
 }
 
-/// The launch window settings with the saved frame restored. On macOS the
-/// frame goes fully onto a screen's visible area (AppKit lists the screens
-/// before the window opens); elsewhere no screen list exists yet, so the
-/// size is restored and the window is centered.
+/// The launch window settings with the saved frame restored. The saved frame
+/// is clamped to a real screen's visible area (macOS via AppKit, Windows via
+/// the display enumeration in [`crate::window_frame::visible_screens`]) so a
+/// frame saved on an unplugged or rescaled monitor still lands fully
+/// on-screen at its saved position. On platforms with no pre-open screen
+/// list the size is restored and the window is centered.
 pub fn launch_window_settings(
     transparent: bool,
     saved: Option<crate::window_frame::WindowFrame>,
@@ -167,6 +180,42 @@ impl App {
         })
     }
 
+    /// The first frame was presented (or the fallback fired): show the
+    /// hidden launch window. Once only; later frames and the fallback are
+    /// no-ops.
+    pub(super) fn reveal_window_if_needed(&mut self, id: iced::window::Id) -> Task<Message> {
+        if self.window_revealed {
+            return Task::none();
+        }
+        self.window_revealed = true;
+        self.window_reveal_fallback_armed = false;
+        reveal_window(id)
+    }
+
+    /// Arm the one-shot timer that reveals the window when no frame is
+    /// presented within [`WINDOW_REVEAL_FALLBACK`] of it opening.
+    pub(super) fn arm_window_reveal_fallback(&mut self, id: iced::window::Id) -> Task<Message> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = id;
+            return Task::none();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if self.window_revealed || self.window_reveal_fallback_armed {
+                return Task::none();
+            }
+            self.window_reveal_fallback_armed = true;
+            Task::perform(
+                async move {
+                    tokio::time::sleep(WINDOW_REVEAL_FALLBACK).await;
+                    id
+                },
+                Message::WindowRevealFallback,
+            )
+        }
+    }
+
     /// The window opened on a monitor of this size: shrink it to fit when
     /// it is larger (see [`crate::window_frame::fit_on_monitor`]).
     pub(super) fn fit_window_on_monitor(
@@ -174,6 +223,12 @@ impl App {
         id: iced::window::Id,
         monitor: Option<iced::Size>,
     ) -> Task<Message> {
+        // A maximized or full screen window fills its monitor already;
+        // resizing one restores it to normal on Windows, which would undo
+        // a maximized frame restored at launch.
+        if self.window_fullscreen || self.window_maximized {
+            return Task::none();
+        }
         let (Some(monitor), Some(size)) = (monitor, self.window_size) else {
             return Task::none();
         };
@@ -288,6 +343,33 @@ impl App {
         };
         Task::batch([checkpoint, close])
     }
+}
+
+/// Show a window created hidden. Iced runs window actions queued during a
+/// redraw right after that frame is presented, so the reveal lands on a
+/// painted frame and the unpainted white flash never shows.
+#[cfg(target_os = "windows")]
+fn reveal_window(id: iced::window::Id) -> Task<Message> {
+    iced::window::run(id, |window| {
+        use raw_window_handle::RawWindowHandle;
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        handle.hwnd.get(),
+                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                    );
+                }
+            }
+        }
+    })
+    .discard()
+}
+
+/// Everywhere else the launch window is visible from the start.
+#[cfg(not(target_os = "windows"))]
+fn reveal_window(_id: iced::window::Id) -> Task<Message> {
+    Task::none()
 }
 
 impl App {

@@ -127,6 +127,13 @@ pub enum Message {
     PickerPathFocus,
     /// Settings → Reading width.
     SetReadingWidth(crate::theme::ReadingWidth),
+    /// Settings → Font: set the body font family; `None` uses Inter.
+    SetFontFamily(Option<String>),
+    /// The background OS font enumeration finished; the list is now ready.
+    FontsLoaded(Vec<String>),
+    /// The background check of whether the given body font family covers CJK
+    /// glyphs itself; applies only while that family is still the chosen one.
+    FontCjkCoverage(String, bool),
     /// A left press while the folder picker watches presses (it is open, or
     /// a row click just closed it); `double` when the press completes a
     /// double-click.
@@ -531,6 +538,12 @@ pub enum Message {
     /// The window opened at this inner size (the toolbar centers the file
     /// name on it before any resize).
     WindowOpened(iced::window::Id, iced::Size, Option<iced::Point>),
+    /// The first frame of a hidden launch window has been presented; show the
+    /// window now (Windows only, see `window_settings`).
+    WindowFirstFrame(iced::window::Id),
+    /// The reveal fallback timer fired: the window is shown even if no frame
+    /// was ever presented.
+    WindowRevealFallback(iced::window::Id),
     RefreshWindowModeSettled(iced::window::Id),
     WindowModeChanged(iced::window::Mode),
     /// Palette command: capture the window to a timestamped PNG on the Desktop.

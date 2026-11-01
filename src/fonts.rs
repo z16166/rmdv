@@ -88,6 +88,93 @@ pub const CJK_FAMILY: &str = "Noto Sans TC";
 /// Family name of the half-width punctuation face (same code points).
 pub const PUNCT_FAMILY: &str = "rmdv CJK Punct";
 
+/// Load the OS font list into Iced's font system exactly once. The first
+/// caller pays the few-hundred-millisecond scan, wherever it runs (the first
+/// `view()`, a background font check); later calls are no-ops.
+pub fn ensure_system_fonts_loaded() {
+    static LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| {
+        let fs = iced::advanced::graphics::text::font_system();
+        if let Ok(mut guard) = fs.write() {
+            guard.raw().db_mut().load_system_fonts();
+        }
+        if std::env::var_os("RMDV_BENCH_STARTUP").is_some() {
+            if let Some(d) = crate::bench::since_process_start() {
+                eprintln!("startup: fonts_loaded={:?}", d);
+            }
+        }
+    });
+}
+
+/// Whether `family` shapes simplified AND traditional CJK text with its own
+/// faces at both body weights. When it does, the reader lets CJK runs keep
+/// the user's chosen family instead of pinning them to the bundled
+/// Noto Sans TC. Meant to run on a background worker: the first call pays
+/// the system font scan.
+pub fn family_covers_cjk(family: &str) -> bool {
+    use iced::advanced::graphics::text::cosmic_text::{
+        Attrs, Buffer, Family, Metrics, Shaping, Weight,
+    };
+    ensure_system_fonts_loaded();
+    let fs = iced::advanced::graphics::text::font_system();
+    let Ok(mut guard) = fs.write() else {
+        return false;
+    };
+    let fonts = guard.raw();
+    [Weight::NORMAL, Weight::BOLD].iter().all(|&weight| {
+        // One simplified, one traditional hanzi: both must resolve to the
+        // chosen family, matching the bundled face's Big5 + GB2312 contract.
+        let mut buffer = Buffer::new(fonts, Metrics::new(16.0, 20.0));
+        buffer.set_text(
+            fonts,
+            "中體",
+            &Attrs::new().family(Family::Name(family)).weight(weight),
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(fonts, false);
+        let mut saw_glyph = false;
+        let covered = buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs)
+            .all(|glyph| {
+                saw_glyph = true;
+                fonts
+                    .db()
+                    .face(glyph.font_id)
+                    .is_some_and(|face| face.families.iter().any(|(name, _)| name == family))
+            });
+        saw_glyph && covered
+    })
+}
+
+/// Enumerate the OS font families available to Iced's text shaper. Meant to
+/// run on a background worker (the caller wraps it in `Task::perform`): the
+/// first call loads the system font list, which takes a few hundred
+/// milliseconds and must not block the UI thread. The result is sorted
+/// case-insensitively and deduplicated.
+pub fn list_families() -> Vec<String> {
+    use std::collections::HashSet;
+    let fs = iced::advanced::graphics::text::font_system();
+    let mut seen = HashSet::new();
+    let mut families = Vec::new();
+    if let Ok(mut guard) = fs.write() {
+        // The first `view()` defers `load_system_fonts`; opening Settings
+        // before any view would otherwise see only the bundled faces. It
+        // is idempotent, so calling it again is cheap.
+        guard.raw().db_mut().load_system_fonts();
+        for face in guard.raw().db().faces() {
+            for (family, _lang) in &face.families {
+                if seen.insert(family.clone()) {
+                    families.push(family.clone());
+                }
+            }
+        }
+    }
+    families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    families
+}
+
 #[cfg(test)]
 mod tests {
     use super::BUNDLED;

@@ -64,6 +64,20 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSApplication", "NSResponder", "block2", "NSView", "NSMenu", "NSMenuItem", "NSScreen", "NSCell", "NSVisualEffectView", "NSWindow", "NSColor", "NSGraphics", "NSAppearance", "objc2-core-foundation"] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
+[target.'cfg(windows)'.dependencies]
+# Window-frame restore needs the list of monitors and each one's work area
+# plus DPI before the window opens (so the saved frame is clamped to a real
+# screen in logical coordinates). 0.48 matches the version Winit pulls in.
+windows-sys = { version = "0.48", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Reveal the hidden launch window (see app::lifecycle::reveal_window): the
+# HWND comes from the window's raw handle. 0.6 matches Iced's runtime.
+raw-window-handle = "0.6"
+
 [features]
 # `pdf` is on by default so `.pdf` files render as markdown out of the box
 # (cargo run / installed app). Build with `--no-default-features` to drop it

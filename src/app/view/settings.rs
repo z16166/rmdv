@@ -116,6 +116,7 @@ fn section_title(row: SettingsRow) -> &'static str {
         | SettingsRow::FontSize
         | SettingsRow::LineSpacing
         | SettingsRow::ReadingWidth
+        | SettingsRow::Font
         | SettingsRow::Toolbar => "Appearance",
         SettingsRow::Footer
         | SettingsRow::HiddenFiles
@@ -286,6 +287,42 @@ fn settings_row_body<'a>(app: &'a App, row: SettingsRow, pal: Palette) -> Elemen
             .into(),
             pal,
         ),
+        SettingsRow::Font => {
+            let control: Element<'a, Message> = match &app.fonts {
+                None => text("Loading fonts…").size(13).color(pal.subtle).into(),
+                Some(fonts) if fonts.is_empty() => {
+                    text("No fonts found").size(13).color(pal.subtle).into()
+                }
+                Some(fonts) => {
+                    let options: Vec<FontChoice> = std::iter::once(FontChoice::Default)
+                        .chain(fonts.iter().cloned().map(FontChoice::Named))
+                        .collect();
+                    let selected = app
+                        .font_family
+                        .clone()
+                        .map_or(FontChoice::Default, FontChoice::Named);
+                    iced::widget::pick_list(options, Some(selected), |choice| {
+                        Message::SetFontFamily(match choice {
+                            FontChoice::Default => None,
+                            FontChoice::Named(family) => Some(family),
+                        })
+                    })
+                    .text_size(13)
+                    .padding(Padding::from([6, 12]))
+                    .width(Length::Fixed(240.0))
+                    .menu_height(Length::Fixed(360.0))
+                    .style(move |_, status| pick_list_style(status, pal))
+                    .menu_style(move |_| pick_list_menu_style(pal))
+                    .into()
+                }
+            };
+            labeled(
+                "Font",
+                "Body text typeface. CJK falls back to Noto Sans TC.".into(),
+                control,
+                pal,
+            )
+        }
         SettingsRow::Toolbar => labeled(
             "Toolbar",
             "Show it when the pointer reaches the top edge, or always.".into(),
@@ -744,6 +781,58 @@ fn slider_style(status: iced::widget::slider::Status, pal: Palette) -> iced::wid
             border_width: 1.0,
             border_color: pal.border_strong(),
         },
+    }
+}
+
+/// A font dropdown option: the bundled default or an installed family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FontChoice {
+    Default,
+    Named(String),
+}
+
+impl std::fmt::Display for FontChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FontChoice::Default => write!(f, "Inter (default)"),
+            FontChoice::Named(family) => f.write_str(family),
+        }
+    }
+}
+
+fn pick_list_style(
+    status: iced::widget::pick_list::Status,
+    pal: Palette,
+) -> iced::widget::pick_list::Style {
+    use iced::widget::pick_list::Status;
+    iced::widget::pick_list::Style {
+        text_color: pal.fg,
+        placeholder_color: pal.subtle,
+        handle_color: pal.muted,
+        background: match status {
+            Status::Hovered | Status::Opened { .. } => pal.hover().into(),
+            Status::Active => pal.chip().into(),
+        },
+        border: Border {
+            color: pal.border_strong(),
+            width: 1.0,
+            radius: theme::radius::SM.into(),
+        },
+    }
+}
+
+fn pick_list_menu_style(pal: Palette) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: pal.surface_alt.into(),
+        border: Border {
+            color: pal.border(),
+            width: 1.0,
+            radius: theme::radius::SM.into(),
+        },
+        text_color: pal.fg,
+        selected_text_color: pal.fg,
+        selected_background: pal.active().into(),
+        shadow: theme::shadow::MENU,
     }
 }
 
