@@ -35,7 +35,6 @@ const SEARCH_DEBOUNCE_MS: u64 = 80;
 const FILE_FINDER_RESULT_CAP: usize = 200;
 /// Rows the file finder renders; keyboard selection stays within them.
 const FILE_FINDER_ROW_CAP: usize = 80;
-const READING_MAX: f32 = theme::READING_MAX_PX;
 /// The Zen editor's line height, relative to its font size.
 const EDITOR_LINE_HEIGHT: f32 = 1.55;
 /// Radius of the reader panel's top-left corner next to the sidebar.
@@ -216,6 +215,9 @@ pub struct App {
     pub typography_base: Typography,
     pub font_scale: f32,
     pub line_spacing: theme::LineSpacing,
+    /// Main document column width (Settings → Reading width). Applies to the
+    /// reader, the Raw/Zen editors, and previews alike.
+    pub reading_width: theme::ReadingWidth,
     pub show_footer: bool,
     pub error: Option<String>,
     /// The file or folder the error card's Reveal in Finder shows, with the
@@ -326,6 +328,12 @@ pub struct App {
     pub picker: Option<Picker>,
     /// What the picker's last row click did; see `PickerClick`.
     picker_click: PickerClick,
+    /// The picker path field's text. Mirrors the picker's `cwd` until the
+    /// user edits it, at which point `picker_path_dirty` keeps typing from
+    /// retargeting list navigation.
+    pub picker_path: String,
+    /// The path field has been edited and not yet submitted or resolved.
+    pub picker_path_dirty: bool,
     /// Opt-in workspace navigator. Kept separate from the document's
     /// `ViewMode::Mindmap` state so entering/exiting it cannot disturb an open
     /// document mindmap or Zen editor.
@@ -662,6 +670,7 @@ impl Default for App {
             typography_base: Typography::DEFAULT,
             font_scale,
             line_spacing: prefs.line_spacing,
+            reading_width: prefs.reading_width,
             show_footer: prefs.show_footer,
             error: None,
             error_path: None,
@@ -711,6 +720,8 @@ impl Default for App {
             settings_cursor: 0,
             picker: None,
             picker_click: PickerClick::Idle,
+            picker_path: String::new(),
+            picker_path_dirty: false,
             full_mindmap: None,
             full_mindmap_request_seq: 0,
             tree_viewport: None,
@@ -1985,6 +1996,26 @@ impl App {
     fn overlay_input_id() -> iced::widget::Id {
         iced::widget::Id::new("overlay-input")
     }
+    /// The folder picker's editable path field. Kept separate from the
+    /// overlay query so opening the picker never focuses (and hijacks)
+    /// navigation keys into the text field.
+    fn picker_path_input_id() -> iced::widget::Id {
+        iced::widget::Id::new("picker-path-input")
+    }
+
+    /// The reading column cap as `render` understands it.
+    fn doc_reading_width(&self) -> crate::render::ReadingWidth {
+        match self.reading_width.px() {
+            Some(px) => crate::render::ReadingWidth::Capped(px),
+            None => crate::render::ReadingWidth::Fill,
+        }
+    }
+
+    /// The same cap for `container::max_width` (pixels); `Full` is unbounded
+    /// so the full-width setting follows the window.
+    fn doc_max_width(&self) -> f32 {
+        self.reading_width.px().unwrap_or(f32::INFINITY)
+    }
     fn vault_input_id() -> iced::widget::Id {
         iced::widget::Id::new("vault-input")
     }
@@ -2916,7 +2947,13 @@ impl App {
                     .as_ref()
                     .and_then(|p| p.parent().map(|x| x.to_path_buf()))
             });
-            self.picker = Some(Picker::new(start, PickerMode::OpenAny, self.show_hidden));
+            let picker = Picker::new(start, PickerMode::OpenAny, self.show_hidden);
+            // The path field starts on the picker's own starting folder and
+            // is not dirty, so keys keep their list-navigation meaning until
+            // the user edits or focuses it.
+            self.picker_path = picker.cwd.display().to_string();
+            self.picker_path_dirty = false;
+            self.picker = Some(picker);
         } else {
             self.picker = None;
         }
@@ -3372,6 +3409,8 @@ impl App {
             menu_open: self.context_menu.is_some(),
             renaming: self.tree_rename.is_some(),
             slots_popover: self.quick_slots_pinned && self.quick_slots_rail_allowed(),
+            folder_picker_open: self.overlay == Overlay::FolderPicker && !full_mindmap,
+            picker_path_dirty: self.picker_path_dirty,
         }
     }
 
@@ -3744,7 +3783,7 @@ impl App {
                             container(editor)
                                 .width(Length::Fill)
                                 .height(Length::Fill)
-                                .max_width(READING_MAX),
+                                .max_width(self.doc_max_width()),
                         )
                         .width(Length::Fill)
                         .height(Length::Fill)
@@ -3763,7 +3802,7 @@ impl App {
                     container(
                         container(fallback)
                             .width(Length::Fill)
-                            .max_width(READING_MAX),
+                            .max_width(self.doc_max_width()),
                     )
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -3789,7 +3828,7 @@ impl App {
                         true,
                         (0, 0),
                         recently_scrolled,
-                        crate::render::ReadingWidth::Capped,
+                        self.doc_reading_width(),
                         self.copy_flash.map(|(_, key)| key),
                     )
                 }
@@ -3809,7 +3848,7 @@ impl App {
                     true,
                     (0, 0),
                     recently_scrolled,
-                    crate::render::ReadingWidth::Capped,
+                    self.doc_reading_width(),
                     self.copy_flash.map(|(_, key)| key),
                 )
             };
@@ -3829,7 +3868,7 @@ impl App {
                 let select_all = self.reader_select_all && self.reader_shows_document();
                 let column = container(body)
                     .id(iced::widget::Id::new("reader-column"))
-                    .max_width(READING_MAX)
+                    .max_width(self.doc_max_width())
                     .width(Length::Fill)
                     .style(move |_| container::Style {
                         background: select_all.then(|| pal.selection.into()),
@@ -4035,9 +4074,12 @@ impl App {
 
         let overlay_layer: Element<'_, Message> = match self.overlay {
             Overlay::None => Space::new().into(),
-            Overlay::FolderPicker => {
-                folder_picker_overlay(self.picker.as_ref(), self.overlay_selected, pal)
-            }
+            Overlay::FolderPicker => folder_picker_overlay(
+                self.picker.as_ref(),
+                self.overlay_selected,
+                &self.picker_path,
+                pal,
+            ),
             Overlay::FileFinder => {
                 let files = self.filtered_files();
                 file_finder_overlay(&self.overlay_query, files, self.overlay_selected, pal)

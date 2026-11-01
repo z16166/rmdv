@@ -8796,6 +8796,37 @@ fn settings_rows_change_the_same_state_as_their_commands_and_persist() {
     assert_eq!(saved(&isolated).line_spacing, LineSpacing::Default);
     assert_eq!(app.typography.line_height, 1.5);
 
+    // Reading width: → widens and saves; ← walks back down to the 720
+    // rollback step; Space widens again; Reset returns to the 1200 default.
+    use crate::theme::ReadingWidth;
+    assert_eq!(app.reading_width, ReadingWidth::Px1200);
+    assert_eq!(saved(&isolated).reading_width, ReadingWidth::Px1200);
+    at(
+        &mut app,
+        SettingsRow::ReadingWidth,
+        Message::SettingsStep(1),
+    );
+    assert_eq!(app.reading_width, ReadingWidth::Px1440);
+    assert_eq!(saved(&isolated).reading_width, ReadingWidth::Px1440);
+    for _ in 0..4 {
+        at(
+            &mut app,
+            SettingsRow::ReadingWidth,
+            Message::SettingsStep(-1),
+        );
+    }
+    assert_eq!(app.reading_width, ReadingWidth::Px720);
+    assert_eq!(saved(&isolated).reading_width, ReadingWidth::Px720);
+    at(
+        &mut app,
+        SettingsRow::ReadingWidth,
+        Message::SettingsActivate,
+    );
+    assert_eq!(app.reading_width, ReadingWidth::Px860);
+    let _ = app.update(Message::SetReadingWidth(ReadingWidth::Px1200));
+    assert_eq!(app.reading_width, ReadingWidth::Px1200);
+    assert_eq!(saved(&isolated).reading_width, ReadingWidth::Px1200);
+
     // Theme: → switches to the next card and saves it; ← stops at the first.
     let start = app
         .theme_entries()
@@ -9049,6 +9080,9 @@ fn dragging_across_paragraphs_copies_the_text_in_between() {
 
     let source = "alpha one two\n\nbravo three four\n\ncharlie five six\n".to_string();
     let mut app = App::default();
+    // The coordinates below assume the 720 px column this test predates; pin
+    // it so the reading-width default changing does not move the text.
+    app.reading_width = crate::theme::ReadingWidth::Px720;
     let _ = app.update(Message::FileLoaded(Ok((
         std::path::PathBuf::from("/tmp/xblock.md"),
         source,
@@ -9069,9 +9103,9 @@ fn dragging_across_paragraphs_copies_the_text_in_between() {
         &mut renderer,
     );
 
-    // The reading column is centred (max 720 px) under a 56 px top padding;
-    // paragraphs are 24 px lines with an 8 px gap. Start inside the first
-    // paragraph, end inside the third.
+    // The reading column is centred at its pinned 720 px width under a 56 px
+    // top padding; paragraphs are 24 px lines with an 8 px gap. Start inside
+    // the first paragraph, end inside the third.
     // x = 281 is on the left half of the "a" in "alpha", so the copy starts
     // before it (285 lands after it).
     let start = Point::new(281.0, 66.0);

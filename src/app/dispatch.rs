@@ -2732,6 +2732,8 @@ impl App {
                 if let Some(pk) = self.picker.as_mut() {
                     if p.is_dir() {
                         pk.navigate_to(p.clone());
+                        self.picker_path = pk.cwd.display().to_string();
+                        self.picker_path_dirty = false;
                         self.overlay_selected = 0;
                         self.list_pointer.settle();
                         // Leaf folder (no subfolders, readable): treat the
@@ -2752,6 +2754,8 @@ impl App {
             Message::PickerParent => {
                 if let Some(pk) = self.picker.as_mut() {
                     pk.parent();
+                    self.picker_path = pk.cwd.display().to_string();
+                    self.picker_path_dirty = false;
                     self.overlay_selected = 0;
                     self.list_pointer.settle();
                 }
@@ -2761,10 +2765,60 @@ impl App {
                 if let Some(home) = Picker::home() {
                     if let Some(pk) = self.picker.as_mut() {
                         pk.navigate_to(home);
+                        self.picker_path = pk.cwd.display().to_string();
+                        self.picker_path_dirty = false;
                     }
                 }
                 Task::none()
             }
+            Message::PickerPathChanged(text) => {
+                self.picker_path = text;
+                self.picker_path_dirty = true;
+                if let Some(pk) = self.picker.as_mut() {
+                    // A new edit clears the previous rejection.
+                    pk.path_error = None;
+                }
+                Task::none()
+            }
+            Message::PickerPathSubmit => {
+                if self.picker.is_none() {
+                    return Task::none();
+                }
+                if !self.picker_path_dirty {
+                    // Untouched field: Enter keeps choosing the list row.
+                    return self.update(Message::OverlayConfirm);
+                }
+                let text = self.picker_path.clone();
+                let Some(pk) = self.picker.as_mut() else {
+                    return Task::none();
+                };
+                match pk.navigate_path(&text) {
+                    Ok(crate::picker::PathTarget::Folder) => {
+                        self.picker_path = pk.cwd.display().to_string();
+                        self.picker_path_dirty = false;
+                        self.overlay_selected = 0;
+                        self.list_pointer.settle();
+                        self.picker_click = PickerClick::Descended(pk.cwd.clone());
+                        // Unlike a row click, submitting a path never
+                        // auto-opens an empty folder as a workspace: the user
+                        // asked to look there, not to choose it.
+                        Task::none()
+                    }
+                    Ok(crate::picker::PathTarget::File(path)) => {
+                        Task::done(Message::PickerOpenFile(path))
+                    }
+                    // `picker.navigate_path` stored a non-blocking hint.
+                    Err(_) => Task::none(),
+                }
+            }
+            Message::PickerPathFocus => {
+                if self.picker.is_none() {
+                    return Task::none();
+                }
+                self.picker_path_dirty = true;
+                iced::widget::operation::focus(Self::picker_path_input_id())
+            }
+            Message::SetReadingWidth(width) => self.set_reading_width(width),
             Message::PickerPointerPress { double } => {
                 // Any press consumes the last row click. Only the press that
                 // completes a double-click on the folder that click
@@ -2917,6 +2971,8 @@ impl App {
                         if let Some(e) = pk.entries.get(self.overlay_selected).cloned() {
                             if e.is_dir {
                                 pk.navigate_to(e.path);
+                                self.picker_path = pk.cwd.display().to_string();
+                                self.picker_path_dirty = false;
                                 self.overlay_selected = 0;
                                 self.list_pointer.settle();
                                 // Leaf folder: auto-open as workspace.

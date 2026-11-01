@@ -685,8 +685,103 @@ pub fn contrast_ratio(a: Color, b: Color) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// Reading column cap for the main document area: Notion's 720 px page width.
-pub const READING_MAX_PX: f32 = 720.0;
+/// The Settings → Reading width ladder for the main document column.
+///
+/// `Full` leaves only the reader's own padding, so the text follows the
+/// window; every other step is a fixed logical-pixel cap. The default is
+/// 1200 px: readable on a 4K display at 200% scaling without spanning the
+/// whole window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadingWidth {
+    #[serde(rename = "640")]
+    Px640,
+    #[serde(rename = "720")]
+    Px720,
+    #[serde(rename = "860")]
+    Px860,
+    #[serde(rename = "1040")]
+    Px1040,
+    #[serde(rename = "1200")]
+    Px1200,
+    #[serde(rename = "1440")]
+    Px1440,
+    #[serde(rename = "full")]
+    Full,
+}
+
+impl ReadingWidth {
+    pub const ALL: [ReadingWidth; 7] = [
+        ReadingWidth::Px640,
+        ReadingWidth::Px720,
+        ReadingWidth::Px860,
+        ReadingWidth::Px1040,
+        ReadingWidth::Px1200,
+        ReadingWidth::Px1440,
+        ReadingWidth::Full,
+    ];
+
+    /// The fixed cap in logical pixels; `None` for the full-width step.
+    pub fn px(self) -> Option<f32> {
+        match self {
+            ReadingWidth::Px640 => Some(640.0),
+            ReadingWidth::Px720 => Some(720.0),
+            ReadingWidth::Px860 => Some(860.0),
+            ReadingWidth::Px1040 => Some(1040.0),
+            ReadingWidth::Px1200 => Some(1200.0),
+            ReadingWidth::Px1440 => Some(1440.0),
+            ReadingWidth::Full => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReadingWidth::Px640 => "640 px",
+            ReadingWidth::Px720 => "720 px",
+            ReadingWidth::Px860 => "860 px",
+            ReadingWidth::Px1040 => "1040 px",
+            ReadingWidth::Px1200 => "1200 px",
+            ReadingWidth::Px1440 => "1440 px",
+            ReadingWidth::Full => "Full width",
+        }
+    }
+
+    /// One step toward the widest setting (`dir` > 0), without wrapping.
+    pub fn step(self, dir: i32) -> ReadingWidth {
+        let i = Self::ALL.iter().position(|w| *w == self).unwrap_or(4) as i32;
+        Self::ALL[(i + dir.signum()).clamp(0, Self::ALL.len() as i32 - 1) as usize]
+    }
+
+    /// Map a raw pixel value onto the nearest ladder step, with `0` and
+    /// non-finite values meaning `Full`. Used by lenient prefs loading so a
+    /// hand-edited number still becomes a valid step.
+    pub fn from_pixels(px: f32) -> ReadingWidth {
+        if !px.is_finite() || px <= 0.0 {
+            return ReadingWidth::Full;
+        }
+        let fixed = Self::ALL
+            .iter()
+            .copied()
+            .filter(|w| w.px().is_some())
+            .min_by(|a, b| {
+                let da = (a.px().unwrap_or(0.0) - px).abs();
+                let db = (b.px().unwrap_or(0.0) - px).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        // A value beyond the largest fixed step is the full-width choice.
+        let widest = Self::Px1440.px().unwrap_or(1440.0);
+        if px > widest + (widest - Self::Px1200.px().unwrap_or(1200.0)) / 2.0 {
+            ReadingWidth::Full
+        } else {
+            fixed.unwrap_or(ReadingWidth::Px1200)
+        }
+    }
+}
+
+impl Default for ReadingWidth {
+    fn default() -> Self {
+        ReadingWidth::Px1200
+    }
+}
 
 /// Heading line height. Fixed: the Line spacing setting changes body text only.
 pub const HEADING_LINE_HEIGHT: f32 = 1.3;
@@ -696,6 +791,10 @@ pub struct Typography {
     pub body_size: f32,
     /// Body line height, relative to the font size.
     pub line_height: f32,
+    /// Theme metadata: nominal characters per line for prose. The reader's
+    /// actual column cap is the user's [`ReadingWidth`] setting, so this value
+    /// is descriptive only and does not drive layout. Theme files may still
+    /// set it for future use.
     pub measure_ch: u32,
     pub h1_size: f32,
     pub h2_size: f32,
@@ -1041,7 +1140,17 @@ mod tests {
         assert_eq!(t.h3_size, 20.0);
         assert!((t.h4_size - 18.4).abs() < 1e-4);
         assert!((t.code_size - 13.6).abs() < 1e-4);
-        assert_eq!(READING_MAX_PX, 720.0);
+        assert_eq!(ReadingWidth::default(), ReadingWidth::Px1200);
+        assert_eq!(ReadingWidth::default().px(), Some(1200.0));
+        assert_eq!(ReadingWidth::Px720.px(), Some(720.0));
+        assert_eq!(ReadingWidth::Px1440.px(), Some(1440.0));
+        assert_eq!(ReadingWidth::Full.px(), None);
+        assert_eq!(ReadingWidth::Px1200.step(1), ReadingWidth::Px1440);
+        assert_eq!(ReadingWidth::Px1440.step(1), ReadingWidth::Full);
+        assert_eq!(ReadingWidth::Px640.step(-1), ReadingWidth::Px640);
+        assert_eq!(ReadingWidth::from_pixels(1000.0), ReadingWidth::Px1040);
+        assert_eq!(ReadingWidth::from_pixels(0.0), ReadingWidth::Full);
+        assert_eq!(ReadingWidth::from_pixels(f32::NAN), ReadingWidth::Full);
         assert_eq!(HEADING_LINE_HEIGHT, 1.3);
     }
 

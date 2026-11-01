@@ -117,6 +117,16 @@ pub enum Message {
     PickerNavigate(PathBuf),
     PickerParent,
     PickerHome,
+    /// The picker's path field changed. Marks it dirty so typing never
+    /// retargets list navigation.
+    PickerPathChanged(String),
+    /// Enter in the picker's path field: validate and navigate, or explain
+    /// why the path cannot be used.
+    PickerPathSubmit,
+    /// ⌘L: move focus into the picker's path field.
+    PickerPathFocus,
+    /// Settings → Reading width.
+    SetReadingWidth(crate::theme::ReadingWidth),
     /// A left press while the folder picker watches presses (it is open, or
     /// a row click just closed it); `double` when the press completes a
     /// double-click.

@@ -8,10 +8,42 @@ use iced::widget::column;
 pub(in crate::app) fn folder_picker_overlay<'a>(
     pk: Option<&'a Picker>,
     selected: usize,
+    path_text: &'a str,
     pal: Palette,
 ) -> Element<'a, Message> {
     let panel: Element<'a, Message> = if let Some(pk) = pk {
         let crumbs = pk.breadcrumbs();
+        // Typed or pasted absolute paths, UNC paths, and `~` shorthands. The
+        // field is clickable and ⌘L focuses it; Enter validates and navigates
+        // instead of choosing the list row under the cursor.
+        let path_field = container(
+            text_input("Type a folder or file path, then press Enter", path_text)
+                .id(App::picker_path_input_id())
+                .on_input(Message::PickerPathChanged)
+                .on_submit(Message::PickerPathSubmit)
+                .padding(Padding::from([8, 10]))
+                .size(13)
+                .width(Length::Fill)
+                .style(move |_, _| iced::widget::text_input::Style {
+                    background: pal.surface_alt.into(),
+                    border: Border {
+                        color: pal.border(),
+                        width: 1.0,
+                        radius: theme::radius::SM.into(),
+                    },
+                    icon: pal.muted,
+                    placeholder: pal.subtle,
+                    value: pal.fg,
+                    selection: pal.selection,
+                }),
+        )
+        .padding(Padding {
+            top: 10.0,
+            right: 14.0,
+            bottom: 0.0,
+            left: 14.0,
+        })
+        .width(Length::Fill);
         let mut crumb_row = iced::widget::Row::new()
             .spacing(2)
             .align_y(iced::Alignment::Center);
@@ -53,8 +85,41 @@ pub(in crate::app) fn folder_picker_overlay<'a>(
             );
         }
         let header = container(crumb_row)
-            .padding(Padding::from([10, 14]))
+            .padding(Padding::from([8, 14]))
             .width(Length::Fill);
+
+        // Every drive (Windows) or mount point (Unix) is one click away,
+        // independent of how deep `cwd` is.
+        let mut roots_col = Column::new().spacing(4);
+        if !pk.roots.is_empty() {
+            for chunk in pk.roots.chunks(8) {
+                let mut row = iced::widget::Row::new()
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center);
+                for root in chunk {
+                    row = row.push(picker_root_chip(root, pk.cwd == *root, pal));
+                }
+                roots_col = roots_col.push(row);
+            }
+        }
+        let roots_row = container(roots_col).padding(Padding {
+            top: 4.0,
+            right: 14.0,
+            bottom: 4.0,
+            left: 14.0,
+        });
+
+        let error_hint: Option<Element<'a, Message>> = pk.path_error.as_ref().map(|message| {
+            container(text(message.clone()).size(12).color(pal.accent))
+                .padding(Padding {
+                    top: 4.0,
+                    right: 16.0,
+                    bottom: 0.0,
+                    left: 16.0,
+                })
+                .width(Length::Fill)
+                .into()
+        });
 
         let mut list = Column::new().spacing(1).padding(Padding::from([6, 8]));
         if let Some(err) = &pk.error {
@@ -97,12 +162,51 @@ pub(in crate::app) fn folder_picker_overlay<'a>(
             .style(move |_, status| sleek_scrollable_style(status, pal, true));
 
         let footer = picker_hint_footer(pal);
-        column![header, body, footer].into()
+        let mut top = Column::new().spacing(0);
+        top = top.push(path_field);
+        if let Some(hint) = error_hint {
+            top = top.push(hint);
+        }
+        top = top.push(header);
+        top = top.push(roots_row);
+        column![top, body, footer].into()
     } else {
         text("No picker").into()
     };
 
     overlay_frame(panel, pal, 640.0, 560.0)
+}
+
+/// One clickable root target: a drive letter or a mount point. The current
+/// root is filled so the row doubles as a location indicator.
+fn picker_root_chip<'a>(
+    root: &std::path::Path,
+    current: bool,
+    pal: Palette,
+) -> Element<'a, Message> {
+    let label = Picker::root_label(root);
+    let path = root.to_path_buf();
+    let resting = if current {
+        pal.tree_selected_bg
+    } else {
+        Color::TRANSPARENT
+    };
+    button(text(label).size(12).color(pal.fg))
+        .padding(Padding::from([4, 9]))
+        .style(move |_, status| button::Style {
+            background: Some(match status {
+                button::Status::Hovered => Background::Color(pal.hover()),
+                _ => Background::Color(resting),
+            }),
+            text_color: pal.fg,
+            border: Border {
+                radius: theme::radius::SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .on_press(Message::PickerNavigate(path))
+        .into()
 }
 
 pub(in crate::app) fn file_finder_overlay<'a>(
@@ -786,7 +890,9 @@ pub(in crate::app) fn picker_hint_footer<'a>(pal: Palette) -> Element<'a, Messag
         hint("␣", "descend / open"),
         Space::new().width(14),
         // A click on a folder row descends; a double-click opens it, as ↵.
-        hint("↵", "open / double-click"),
+        hint("↵", "open / path"),
+        Space::new().width(14),
+        hint("⌘L", "path"),
         Space::new().width(Length::Fill),
         hint("⎋", "close"),
     ]

@@ -115,6 +115,7 @@ fn section_title(row: SettingsRow) -> &'static str {
         | SettingsRow::GlassOpacity
         | SettingsRow::FontSize
         | SettingsRow::LineSpacing
+        | SettingsRow::ReadingWidth
         | SettingsRow::Toolbar => "Appearance",
         SettingsRow::Footer
         | SettingsRow::HiddenFiles
@@ -255,6 +256,34 @@ fn settings_row_body<'a>(app: &'a App, row: SettingsRow, pal: Palette) -> Elemen
             "Line spacing",
             "Space between lines of body text.".into(),
             line_spacing_control(app.line_spacing, pal),
+            pal,
+        ),
+        SettingsRow::ReadingWidth => labeled(
+            "Reading width",
+            "Cap for the document column; Full follows the window.".into(),
+            irow![
+                small_button(
+                    "−",
+                    Message::SetReadingWidth(app.reading_width.step(-1)),
+                    pal
+                ),
+                container(text(app.reading_width.label()).size(13).color(pal.fg),)
+                    .width(Length::Fixed(92.0))
+                    .align_x(iced::alignment::Horizontal::Center),
+                small_button(
+                    "+",
+                    Message::SetReadingWidth(app.reading_width.step(1)),
+                    pal
+                ),
+                text_button(
+                    "Reset",
+                    Message::SetReadingWidth(crate::theme::ReadingWidth::default()),
+                    pal
+                ),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into(),
             pal,
         ),
         SettingsRow::Toolbar => labeled(

@@ -32,6 +32,10 @@ pub struct Prefs {
     /// theme's line height.
     #[serde(default, deserialize_with = "lenient_line_spacing")]
     pub line_spacing: crate::theme::LineSpacing,
+    /// Main document column width (Settings → Reading width). Defaults to
+    /// 1200 px on a 4K display at 200% scaling; `Full` follows the window.
+    #[serde(default, deserialize_with = "lenient_reading_width")]
+    pub reading_width: crate::theme::ReadingWidth,
     /// Show dot files and folders in the sidebar (⌘⇧.).
     #[serde(default)]
     pub show_hidden: bool,
@@ -223,6 +227,19 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
+/// A missing, unknown, or numeric reading width becomes the nearest valid
+/// ladder step instead of failing the whole file.
+fn lenient_reading_width<'de, D>(deserializer: D) -> Result<crate::theme::ReadingWidth, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(px) = value.as_f64() {
+        return Ok(crate::theme::ReadingWidth::from_pixels(px as f32));
+    }
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 /// An unknown glass mode (e.g. from a newer build) turns glass off instead of
 /// failing the whole file.
 fn lenient_glass<'de, D>(deserializer: D) -> Result<crate::macos_vibrancy::Glass, D::Error>
@@ -296,6 +313,7 @@ impl Default for Prefs {
             glass_opacity: crate::macos_vibrancy::DEFAULT_OPACITY,
             font_scale: default_font_scale(),
             line_spacing: crate::theme::LineSpacing::Default,
+            reading_width: crate::theme::ReadingWidth::default(),
             show_hidden: false,
             mindmap_autocenter: true,
             mindmap_scroll_pans: false,
@@ -450,6 +468,37 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains(r#""line_spacing":"compact""#), "{json}");
+    }
+
+    #[test]
+    fn reading_width_defaults_to_1200_and_survives_bad_values() {
+        use crate::theme::ReadingWidth;
+        // A prefs file from before the setting existed: new users get 1200.
+        let prefs: Prefs = serde_json::from_str(r#"{"show_footer":false}"#).unwrap();
+        assert_eq!(prefs.reading_width, ReadingWidth::Px1200);
+        assert!(!prefs.show_footer);
+        assert_eq!(Prefs::default().reading_width, ReadingWidth::Px1200);
+        // Saved choices load as saved, including the 720 rollback step.
+        let prefs: Prefs = serde_json::from_str(r#"{"reading_width":"720"}"#).unwrap();
+        assert_eq!(prefs.reading_width, ReadingWidth::Px720);
+        let prefs: Prefs = serde_json::from_str(r#"{"reading_width":"full"}"#).unwrap();
+        assert_eq!(prefs.reading_width, ReadingWidth::Full);
+        // A numeric value from a hand-edited or older file maps to a step.
+        let prefs: Prefs = serde_json::from_str(r#"{"reading_width":1180}"#).unwrap();
+        assert_eq!(prefs.reading_width, ReadingWidth::Px1200);
+        let prefs: Prefs = serde_json::from_str(r#"{"reading_width":0}"#).unwrap();
+        assert_eq!(prefs.reading_width, ReadingWidth::Full);
+        // An unknown or malformed value must not reset other preferences.
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"reading_width":"wide","show_footer":false}"#).unwrap();
+        assert_eq!(prefs.reading_width, ReadingWidth::Px1200);
+        assert!(!prefs.show_footer);
+        let json = serde_json::to_string(&Prefs {
+            reading_width: ReadingWidth::Px1440,
+            ..Prefs::default()
+        })
+        .unwrap();
+        assert!(json.contains(r#""reading_width":"1440""#), "{json}");
     }
 
     #[test]

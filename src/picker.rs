@@ -30,9 +30,24 @@ pub struct Picker {
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
     pub selected: usize,
+    /// A read error for the current folder.
     pub error: Option<String>,
+    /// The last rejected path-field submission; cleared on a successful one.
+    pub path_error: Option<String>,
+    /// Jump targets for the root row: every available drive on Windows,
+    /// `/` and mounted volumes elsewhere.
+    pub roots: Vec<PathBuf>,
     pub mode: PickerMode,
     pub show_hidden: bool,
+}
+
+/// What a submitted path field resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathTarget {
+    /// A folder: the picker is already showing it.
+    Folder,
+    /// A supported document: the caller should open it.
+    File(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +69,8 @@ impl Picker {
             entries: Vec::new(),
             selected: 0,
             error: None,
+            path_error: None,
+            roots: Vec::new(),
             mode,
             show_hidden,
         };
@@ -118,18 +135,139 @@ impl Picker {
                 self.error = Some(e.to_string());
             }
         }
+        // Drives and mounts can appear or disappear while the picker is
+        // open, so refresh the root row alongside every folder listing.
+        self.roots = Self::roots();
     }
 
     pub fn navigate_to(&mut self, p: PathBuf) {
         self.cwd = p;
+        self.path_error = None;
         self.refresh();
     }
 
     pub fn parent(&mut self) {
         if let Some(parent) = self.cwd.parent() {
             self.cwd = parent.to_path_buf();
+            self.path_error = None;
             self.refresh();
         }
+    }
+
+    /// The root jump targets for the picker's top row.
+    ///
+    /// Windows enumerates drive letters through `GetLogicalDrives`, which
+    /// covers empty and disconnected drives without probing `X:\\` (probing
+    /// can prompt for removable media). macOS lists `/` and the mounted
+    /// volumes; other Unix platforms list `/` plus `/media` and `/mnt`.
+    pub fn roots() -> Vec<PathBuf> {
+        #[cfg(windows)]
+        {
+            let mut out: Vec<PathBuf> = drive_roots();
+            out.sort();
+            return out;
+        }
+        #[cfg(not(windows))]
+        {
+            let mut out = vec![PathBuf::from("/")];
+            let mounted: &[&str] = if cfg!(target_os = "macos") {
+                &["/Volumes"]
+            } else {
+                &["/media", "/mnt"]
+            };
+            for base in mounted {
+                let Ok(rd) = std::fs::read_dir(base) else {
+                    continue;
+                };
+                let mut found: Vec<PathBuf> = rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                found.sort();
+                out.extend(found);
+            }
+            out
+        }
+    }
+
+    /// How a root jump target is labeled in the picker's root row.
+    pub fn root_label(root: &Path) -> String {
+        #[cfg(windows)]
+        {
+            return root.as_os_str().to_string_lossy().replace('/', "\\");
+        }
+        #[cfg(not(windows))]
+        {
+            if root == Path::new("/") {
+                "/".to_string()
+            } else {
+                root.file_name().map_or_else(
+                    || root.to_string_lossy().into_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            }
+        }
+    }
+
+    /// Resolve the text of the picker's path field and navigate there.
+    ///
+    /// Accepts absolute paths, UNC paths, `~` shorthands (always for the
+    /// real home, not a workspace-relative path), and bare relative paths
+    /// joined to the current folder. A folder navigates the picker; a
+    /// supported document is handed back for the caller to open. Anything
+    /// else sets `path_error` and leaves the listing untouched.
+    pub fn navigate_path(&mut self, input: &str) -> Result<PathTarget, String> {
+        let raw = input.trim();
+        if raw.is_empty() {
+            return Err(self.reject_path("Enter a folder or file path."));
+        }
+        let mut text = raw.to_string();
+        if let Some(rest) = text.strip_prefix('~') {
+            if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
+                let Some(home) = dirs::home_dir() else {
+                    return Err(self.reject_path("No home folder is available."));
+                };
+                text = format!("{}{}", home.display(), rest);
+            }
+        }
+        // A bare drive letter (`D:`) is drive-relative on Windows; the
+        // field's intent there is that drive's root.
+        #[cfg(windows)]
+        if text.len() == 2 && text.ends_with(':') && text.as_bytes()[0].is_ascii_alphabetic() {
+            text.push('\\');
+        }
+        let mut path = PathBuf::from(&text);
+        if path.is_relative() {
+            path = self.cwd.join(path);
+        }
+        // Keep the lexical path: `canonicalize` would rewrite `C:\` into the
+        // `\\?\` extended-length form, which the breadcrumbs and root row
+        // must show as ordinary drive paths.
+        if path.is_dir() {
+            self.navigate_to(path);
+            return Ok(PathTarget::Folder);
+        }
+        if path.is_file() {
+            match self.mode {
+                PickerMode::OpenAny if is_markdown_path(&path) => {
+                    return Ok(PathTarget::File(path));
+                }
+                PickerMode::Folder => {
+                    return Err(self.reject_path("That is a file; pick a folder instead."));
+                }
+                PickerMode::OpenAny => {
+                    return Err(self.reject_path("That file type cannot be opened as a document."));
+                }
+            }
+        }
+        Err(self.reject_path(format!("No such folder or file: {}", path.display())))
+    }
+
+    fn reject_path(&mut self, message: impl Into<String>) -> String {
+        let message = message.into();
+        self.path_error = Some(message.clone());
+        message
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -145,21 +283,52 @@ impl Picker {
         dirs::home_dir()
     }
 
+    /// Click targets from the volume root down to `cwd`.
+    ///
+    /// A Windows drive prefix is only the namespace marker: after pushing
+    /// it and the root separator, the first crumb is the real `C:\` (a
+    /// `C:` target would be drive-relative, i.e. the process's current
+    /// directory on that drive, not its root).
     pub fn breadcrumbs(&self) -> Vec<(String, PathBuf)> {
         let mut out = Vec::new();
         let mut acc = PathBuf::new();
         for c in self.cwd.components() {
             acc.push(c.as_os_str());
-            let label = match c {
-                std::path::Component::RootDir => continue,
-                std::path::Component::Normal(s) => s.to_string_lossy().into_owned(),
-                std::path::Component::Prefix(p) => p.as_os_str().to_string_lossy().into_owned(),
+            match c {
+                std::path::Component::Prefix(_) => continue,
+                std::path::Component::RootDir => {
+                    let label = if cfg!(windows) {
+                        acc.as_os_str().to_string_lossy().into_owned()
+                    } else {
+                        "/".to_string()
+                    };
+                    out.push((label, acc.clone()));
+                }
+                std::path::Component::Normal(s) => {
+                    out.push((s.to_string_lossy().into_owned(), acc.clone()));
+                }
                 _ => continue,
-            };
-            out.push((label, acc.clone()));
+            }
         }
         out
     }
+}
+
+/// Every drive letter the system reports as present. `GetLogicalDrives`
+/// answers with one bit per letter and never touches the media, unlike
+/// probing `X:\`, which can wait on or prompt for a removable drive.
+#[cfg(windows)]
+fn drive_roots() -> Vec<PathBuf> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    // Bit 0 is A:, bit 25 is Z:.
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u32)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .map(|bit| PathBuf::from(format!("{}:\\", (b'A' + bit as u8) as char)))
+        .collect()
 }
 
 pub fn is_markdown_path(p: &Path) -> bool {
@@ -537,6 +706,112 @@ mod tests {
             .collect();
         assert_eq!(hidden_off, vec!["Documents", "Downloads"]);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rmdv-picker-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn roots_are_available_for_the_jump_row() {
+        let roots = Picker::roots();
+        assert!(!roots.is_empty(), "a root row needs at least one target");
+        #[cfg(not(windows))]
+        {
+            assert_eq!(roots[0], PathBuf::from("/"));
+            assert_eq!(Picker::root_label(&roots[0]), "/");
+        }
+    }
+
+    #[test]
+    fn path_field_navigates_absolute_relative_and_spaced_paths() {
+        let root = temp_root("path-field");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(root.join("two words")).unwrap();
+        std::fs::write(root.join("doc.md"), "# Doc\n").unwrap();
+        let mut picker = Picker::new(Some(root.clone()), PickerMode::OpenAny, false);
+
+        let absolute = root.join("nested").display().to_string();
+        assert_eq!(picker.navigate_path(&absolute).unwrap(), PathTarget::Folder);
+        assert_eq!(picker.cwd, root.join("nested"));
+
+        picker.navigate_to(root.clone());
+        assert_eq!(
+            picker.navigate_path("two words").unwrap(),
+            PathTarget::Folder
+        );
+        assert_eq!(picker.cwd, root.join("two words"));
+
+        picker.navigate_to(root.clone());
+        let file = root.join("doc.md");
+        assert_eq!(
+            picker.navigate_path(&file.display().to_string()).unwrap(),
+            PathTarget::File(file.clone())
+        );
+        // A file target leaves the listing where it was.
+        assert_eq!(picker.cwd, root);
+
+        let err = picker.navigate_path("no-such-folder").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(picker.path_error.is_some());
+        assert_eq!(picker.cwd, root, "a bad path must not move the listing");
+
+        picker.navigate_path(&root.display().to_string()).unwrap();
+        assert!(picker.path_error.is_none(), "success clears the hint");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_field_rejects_unsupported_files_in_folder_mode() {
+        let root = temp_root("path-field-folder-mode");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("doc.md");
+        std::fs::write(&file, "# Doc\n").unwrap();
+        let mut picker = Picker::new(Some(root.clone()), PickerMode::Folder, false);
+        assert!(picker.navigate_path(&file.display().to_string()).is_err());
+        assert_eq!(picker.cwd, root);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn breadcrumbs_start_at_the_drive_root_not_a_drive_relative_prefix() {
+        let root = temp_root("crumbs-windows");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut picker = Picker::new(Some(root.clone()), PickerMode::OpenAny, false);
+        // The drive root of whichever volume the temp folder lives on.
+        let drive_root = root.ancestors().last().unwrap().to_path_buf();
+        let crumbs = picker.breadcrumbs();
+        let first = crumbs.first().expect("a drive root crumb");
+        assert_eq!(first.1, drive_root, "first crumb is the real root");
+        assert_eq!(first.0, Picker::root_label(&drive_root));
+        picker.cwd = drive_root.join("Users");
+        let crumbs = picker.breadcrumbs();
+        assert_eq!(crumbs[0].1, drive_root);
+        assert_eq!(crumbs[1], ("Users".to_string(), drive_root.join("Users")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn breadcrumbs_start_at_a_clickable_root() {
+        let root = temp_root("crumbs-unix");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let mut picker = Picker::new(Some(root.join("nested")), PickerMode::OpenAny, false);
+        picker.cwd = root.join("nested");
+        let crumbs = picker.breadcrumbs();
+        assert_eq!(crumbs[0], ("/".to_string(), PathBuf::from("/")));
+        assert_eq!(crumbs.last().unwrap().1, root.join("nested"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

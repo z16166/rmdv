@@ -560,6 +560,10 @@ pub(super) struct KeyContext {
     pub menu_open: bool,
     pub renaming: bool,
     pub slots_popover: bool,
+    /// The folder picker owns the overlay.
+    pub folder_picker_open: bool,
+    /// The picker's path field has been edited and owns typing/Enter.
+    pub picker_path_dirty: bool,
 }
 
 /// The message for one keyboard event on the surface `context` describes.
@@ -586,6 +590,8 @@ pub(super) fn key_message(context: KeyContext, ev: iced::Event, reader_copied: b
         menu_open,
         renaming,
         slots_popover,
+        folder_picker_open,
+        picker_path_dirty,
     } = context;
     use iced::keyboard::{key::Named, Event as KEv, Key};
     if reader_copied && !select_all {
@@ -854,6 +860,35 @@ pub(super) fn key_message(context: KeyContext, ev: iced::Event, reader_copied: b
         if let Some(message) = image_zoom_key_message(&key, mods) {
             return message;
         }
+    }
+    // The folder picker adds a path field. Once it is focused or edited,
+    // typing and Enter belong to the field, never to list navigation; ⌘L
+    // moves focus back there from the list.
+    if overlay_open && folder_picker_open {
+        if let Key::Character(c) = &key {
+            if cmd && c.eq_ignore_ascii_case("l") {
+                return Message::PickerPathFocus;
+            }
+        }
+        if picker_path_dirty {
+            return match key {
+                Key::Named(Named::Enter) => Message::PickerPathSubmit,
+                // Esc already closes the overlay above; every other key is
+                // the text field's.
+                _ => Message::Noop,
+            };
+        }
+        return match key {
+            Key::Named(Named::ArrowDown) => Message::OverlayMove(1),
+            Key::Named(Named::ArrowUp) => Message::OverlayMove(-1),
+            // Enter submits the field, which falls back to confirming the
+            // list row while the field is untouched.
+            Key::Named(Named::Enter) => Message::PickerPathSubmit,
+            Key::Named(Named::Space) => Message::OverlayDescend,
+            Key::Named(Named::ArrowRight) => Message::OverlayDescend,
+            Key::Named(Named::ArrowLeft) => Message::PickerParent,
+            _ => Message::Noop,
+        };
     }
     if overlay_open {
         return match key {

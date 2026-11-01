@@ -13,6 +13,7 @@ pub enum SettingsRow {
     GlassOpacity,
     FontSize,
     LineSpacing,
+    ReadingWidth,
     Toolbar,
     Footer,
     HiddenFiles,
@@ -36,6 +37,7 @@ impl SettingsRow {
         rows.extend([
             FontSize,
             LineSpacing,
+            ReadingWidth,
             Toolbar,
             Footer,
             HiddenFiles,
@@ -120,6 +122,7 @@ impl App {
             SettingsRow::Glass => Message::SetGlass(self.prefs.glass.next()),
             SettingsRow::FontSize => Message::FontSizeReset,
             SettingsRow::LineSpacing => Message::SetLineSpacing(crate::theme::LineSpacing::Default),
+            SettingsRow::ReadingWidth => Message::SetReadingWidth(self.reading_width.step(1)),
             SettingsRow::Toolbar => Message::SetToolbarMode(self.prefs.toolbar.toggled()),
             SettingsRow::Footer => Message::ToggleFooter,
             SettingsRow::HiddenFiles => Message::ToggleHidden,
@@ -170,6 +173,10 @@ impl App {
                 let next = self.line_spacing.step(dir);
                 (next != self.line_spacing).then_some(Message::SetLineSpacing(next))
             }
+            SettingsRow::ReadingWidth => {
+                let next = self.reading_width.step(dir);
+                (next != self.reading_width).then_some(Message::SetReadingWidth(next))
+            }
             SettingsRow::Toolbar => {
                 let next = if forward {
                     crate::prefs::ToolbarMode::Always
@@ -219,6 +226,21 @@ impl App {
         self.prefs.line_spacing = spacing;
         self.save_prefs();
         // Every measured block height changed with the line height.
+        self.height_cache.clear();
+        self.rebuild_virt_here();
+        let preview_measure = self.refresh_full_mindmap_preview_heights();
+        Task::batch([self.measure_window_heights(), preview_measure])
+    }
+
+    pub(super) fn set_reading_width(&mut self, width: crate::theme::ReadingWidth) -> Task<Message> {
+        if self.reading_width == width {
+            return Task::none();
+        }
+        self.reading_width = width;
+        self.prefs.reading_width = width;
+        self.save_prefs();
+        // The reader, editors, and previews share this cap; widths that
+        // change the wrapped text invalidate measured block heights.
         self.height_cache.clear();
         self.rebuild_virt_here();
         let preview_measure = self.refresh_full_mindmap_preview_heights();

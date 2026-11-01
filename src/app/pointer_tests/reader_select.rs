@@ -28,8 +28,11 @@ fn a_press_in_the_margin_starts_a_selection_at_the_nearest_text() {
     let text = paragraph(&mut ui, &app);
     let y = text.y + 8.0;
     // The left margin beside the reading column, level with the paragraph.
-    let margin = Point::new(24.0, y);
-    assert!(margin.x < text.x - 40.0, "{margin:?} is left of {text:?}");
+    // The column is centered at the configured reading width, so the margin
+    // is whatever the window leaves; any point left of the first glyph
+    // qualifies.
+    let margin = Point::new((text.x - 16.0).max(2.0), y);
+    assert!(margin.x < text.x, "{margin:?} is left of {text:?}");
     drag(&mut app, &mut ui, margin, Point::new(text.x + 80.0, y));
 
     let got = selected(&mut app, &mut ui, Point::new(text.x + 30.0, y));

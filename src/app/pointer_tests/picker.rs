@@ -222,14 +222,14 @@ fn second_press_after_a_leaf_open_does_not_reach_the_view_below() {
 }
 
 #[test]
-fn picker_footer_has_no_open_this_folder_button_and_names_double_click() {
+fn picker_footer_has_no_open_this_folder_button_and_names_enter_path() {
     let fx = Fixture::new("footer");
     let app = fx.app();
     let mut ui = PointerUi::new();
     assert!(ui.text_bounds(&app, "Open This Folder").is_none());
     assert!(
-        ui.text_bounds(&app, "open / double-click").is_some(),
-        "the Enter hint names the pointer path"
+        ui.text_bounds(&app, "open / path").is_some(),
+        "the Enter hint names both the pointer open path and the typed path"
     );
 }
 

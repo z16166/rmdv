@@ -27,19 +27,19 @@ pub struct Highlight {
 }
 
 /// How wide `render` lets its content column grow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReadingWidth {
-    /// Main reading area: capped at the reading column (`READING_MAX_PX`).
-    Capped,
-    /// Side panels: fill whatever width the panel gives.
+    /// Main reading area: capped at this logical-pixel width (the user's
+    /// Settings → Reading width choice).
+    Capped(f32),
+    /// Side panels and the full-width setting: fill whatever width the
+    /// parent gives.
     Fill,
 }
 
-const READING_MAX: f32 = crate::theme::READING_MAX_PX;
-
 fn reading_max_width(width: ReadingWidth) -> f32 {
     match width {
-        ReadingWidth::Capped => READING_MAX,
+        ReadingWidth::Capped(px) => px,
         ReadingWidth::Fill => f32::INFINITY,
     }
 }
@@ -140,8 +140,9 @@ pub fn render<'a>(
         col = col.push(Space::new().height(h));
     }
 
-    // Reading column cap: READING_MAX_PX (theme.rs).
-    let _ = typ.measure_ch;
+    // The reader's column cap is the user's `ReadingWidth` setting; the
+    // theme's `measure_ch` is descriptive metadata only and never bounds
+    // layout, so it is intentionally unused here.
     let body: Element<'a, Message> = if keyed_widget_reuse {
         KeyedBody::new(keys, col).into()
     } else {
@@ -2944,7 +2945,8 @@ mod tests {
 
     #[test]
     fn reading_width_caps_main_area_and_fills_panels() {
-        assert_eq!(reading_max_width(ReadingWidth::Capped), 720.0);
+        assert_eq!(reading_max_width(ReadingWidth::Capped(720.0)), 720.0);
+        assert_eq!(reading_max_width(ReadingWidth::Capped(1200.0)), 1200.0);
         assert!(reading_max_width(ReadingWidth::Fill) > 10_000.0);
     }
 
