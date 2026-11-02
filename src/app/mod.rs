@@ -230,6 +230,9 @@ pub struct App {
     /// OS font families loaded in the background when Settings first opens.
     /// `None` while the list is still loading.
     pub fonts: Option<Vec<String>>,
+    /// The Settings font menu is open. While it is, pointer moves over the
+    /// rest of the page do not move the settings cursor.
+    font_menu_open: bool,
     pub show_footer: bool,
     pub error: Option<String>,
     /// The file or folder the error card's Reveal in Finder shows, with the
@@ -382,6 +385,10 @@ pub struct App {
     /// Whether the launch window has been shown. On Windows it starts hidden
     /// (`window_settings`) and the first presented frame reveals it.
     pub window_revealed: bool,
+    /// Presented frames since the hidden launch window was created. See
+    /// [`lifecycle::next_window_reveal`].
+    #[cfg(target_os = "windows")]
+    window_reveal_stage: u8,
     /// Whether the one-shot reveal fallback timer is in flight; it shows the
     /// window even if no frame is ever presented (a hidden window may never
     /// get a paint request).
@@ -693,6 +700,7 @@ impl Default for App {
             font_family: prefs.font_family.clone(),
             font_family_cjk: false,
             fonts: None,
+            font_menu_open: false,
             show_footer: prefs.show_footer,
             error: None,
             error_path: None,
@@ -763,6 +771,8 @@ impl Default for App {
             window_frame_changed_at: None,
             window_frame_settle_armed: false,
             window_revealed: !cfg!(target_os = "windows"),
+            #[cfg(target_os = "windows")]
+            window_reveal_stage: 0,
             window_reveal_fallback_armed: false,
             overlay_viewport: None,
             body_viewport: None,
@@ -3593,11 +3603,13 @@ impl App {
             iced::window::Event::Resized(size) => Some(Message::WindowResized(id, size)),
             _ => None,
         });
-        // Windows: the launch window is hidden; its first presented frame
-        // reveals it, so the white frame flash before it never appears. The
-        // reveal flips `window_revealed`, and this subscription is dropped on
-        // the next pass. (Kept apart from `window_events`: `filter_map`
-        // requires a zero-sized, non-capturing closure.)
+        // Windows: the launch window is hidden, then shown while DWM-cloaked.
+        // Each presented frame advances that sequence; the cloak lifts only
+        // after a frame that was presented while cloaked, so the border never
+        // flashes on its own. The reveal flips `window_revealed`, and this
+        // subscription is dropped on the next pass. (Kept apart from
+        // `window_events`: `filter_map` requires a zero-sized, non-capturing
+        // closure.)
         let window_first_frame = if self.window_revealed {
             iced::Subscription::none()
         } else {

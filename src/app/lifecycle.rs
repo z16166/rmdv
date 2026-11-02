@@ -24,9 +24,9 @@ pub fn window_settings(transparent: bool) -> iced::window::Settings {
         min_size: Some(WINDOW_MIN_SIZE),
         // The app decides: unsaved edits ask before the window closes.
         exit_on_close_request: false,
-        // Windows: open hidden; the first presented frame shows the window,
-        // so the white frame flash before it never appears (see
-        // `reveal_window`).
+        // Windows: open hidden. The first presented frames stay cloaked, and
+        // only then is the cloak lifted, so the window border never flashes
+        // before the first painted frame (see `advance_window_reveal`).
         #[cfg(target_os = "windows")]
         visible: false,
         ..Default::default()
@@ -180,16 +180,54 @@ impl App {
         })
     }
 
-    /// The first frame was presented (or the fallback fired): show the
-    /// hidden launch window. Once only; later frames and the fallback are
-    /// no-ops.
-    pub(super) fn reveal_window_if_needed(&mut self, id: iced::window::Id) -> Task<Message> {
-        if self.window_revealed {
+    /// A presented frame of the hidden launch window. The window is shown
+    /// cloaked first, so DWM can composite a real frame, and the cloak is
+    /// lifted only after a frame that was presented while cloaked. Showing
+    /// it on the first `RedrawRequested` paints the border for one frame:
+    /// that present happened while the window was still hidden.
+    pub(super) fn advance_window_reveal(&mut self, id: iced::window::Id) -> Task<Message> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = id;
+            Task::none()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if self.window_revealed {
+                return Task::none();
+            }
+            let (stage, step) = next_window_reveal(self.window_reveal_stage);
+            self.window_reveal_stage = stage;
+            match step {
+                RevealStep::Cloak => cloak_show_window(id),
+                RevealStep::Wait => redraw_window(id),
+                RevealStep::Show => {
+                    self.window_revealed = true;
+                    self.window_reveal_fallback_armed = false;
+                    uncloak_window(id)
+                }
+            }
+        }
+    }
+
+    /// No frame arrived in time: show the window even if that flashes.
+    /// A cloaked window that never presents would otherwise stay invisible.
+    pub(super) fn force_window_reveal(&mut self, id: iced::window::Id) -> Task<Message> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = id;
             return Task::none();
         }
-        self.window_revealed = true;
-        self.window_reveal_fallback_armed = false;
-        reveal_window(id)
+        #[cfg(target_os = "windows")]
+        {
+            if self.window_revealed {
+                return Task::none();
+            }
+            self.window_revealed = true;
+            self.window_reveal_stage = 3;
+            self.window_reveal_fallback_armed = false;
+            uncloak_window(id)
+        }
     }
 
     /// Arm the one-shot timer that reveals the window when no frame is
@@ -345,31 +383,109 @@ impl App {
     }
 }
 
-/// Show a window created hidden. Iced runs window actions queued during a
-/// redraw right after that frame is presented, so the reveal lands on a
-/// painted frame and the unpainted white flash never shows.
+/// What the next presented frame should do to the cloaked launch window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevealStep {
+    /// Show the window while DWM-cloaked, then ask for a frame.
+    Cloak,
+    /// The cloak was queued on this turn or the present just reported was
+    /// still hidden. Wait for another presented frame.
+    Wait,
+    /// A frame has been presented while the window was shown and cloaked.
+    Show,
+}
+
+/// `stage` counts presented frames since the window was created hidden.
+/// `0` cloaks and shows, `1` waits for a present that happened after that,
+/// and anything later lifts the cloak.
+fn next_window_reveal(stage: u8) -> (u8, RevealStep) {
+    match stage {
+        0 => (1, RevealStep::Cloak),
+        1 => (2, RevealStep::Wait),
+        stage => (stage, RevealStep::Show),
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn reveal_window(id: iced::window::Id) -> Task<Message> {
-    iced::window::run(id, |window| {
+fn with_hwnd(
+    id: iced::window::Id,
+    f: impl FnOnce(windows_sys::Win32::Foundation::HWND) + Send + 'static,
+) -> Task<Message> {
+    iced::window::run(id, move |window| {
         use raw_window_handle::RawWindowHandle;
-        if let Ok(handle) = window.window_handle() {
-            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                        handle.hwnd.get(),
-                        windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
-                    );
-                }
-            }
-        }
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return;
+        };
+        f(handle.hwnd.get());
     })
     .discard()
 }
 
-/// Everywhere else the launch window is visible from the start.
-#[cfg(not(target_os = "windows"))]
-fn reveal_window(_id: iced::window::Id) -> Task<Message> {
-    Task::none()
+#[cfg(target_os = "windows")]
+fn set_cloaked(hwnd: windows_sys::Win32::Foundation::HWND, cloaked: bool) {
+    let value: i32 = i32::from(cloaked);
+    unsafe {
+        // `DWMWA_CLOAK`: the window can present, and DWM does not composite
+        // it until the cloak is lifted. Set before `ShowWindow`, so the
+        // border is never composited on its own.
+        let _ = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            hwnd,
+            windows_sys::Win32::Graphics::Dwm::DWMWA_CLOAK,
+            &value as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
+/// Show the window while cloaked and ask it to paint. The cloak is set
+/// before `ShowWindow`, so the border is never composited on its own.
+#[cfg(target_os = "windows")]
+fn cloak_show_window(id: iced::window::Id) -> Task<Message> {
+    with_hwnd(id, |hwnd| {
+        set_cloaked(hwnd, true);
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            );
+            windows_sys::Win32::Graphics::Gdi::RedrawWindow(
+                hwnd,
+                std::ptr::null(),
+                0,
+                windows_sys::Win32::Graphics::Gdi::RDW_INTERNALPAINT,
+            );
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn redraw_window(id: iced::window::Id) -> Task<Message> {
+    with_hwnd(id, |hwnd| unsafe {
+        windows_sys::Win32::Graphics::Gdi::RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            0,
+            windows_sys::Win32::Graphics::Gdi::RDW_INTERNALPAINT,
+        );
+    })
+}
+
+/// Lift the cloak. The window is already shown, so this reveals the frame
+/// DWM has already composited.
+#[cfg(target_os = "windows")]
+fn uncloak_window(id: iced::window::Id) -> Task<Message> {
+    with_hwnd(id, |hwnd| {
+        set_cloaked(hwnd, false);
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            );
+        }
+    })
 }
 
 impl App {
@@ -385,5 +501,20 @@ impl App {
         if let Some(store) = self.recent_store.as_deref() {
             self.recent = crate::recent::add_folder_to(store, path).existing();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_window_reveal, RevealStep};
+
+    #[test]
+    fn the_launch_window_is_cloaked_before_it_is_shown() {
+        let (stage, step) = next_window_reveal(0);
+        assert_eq!((stage, step), (1, RevealStep::Cloak));
+        let (stage, step) = next_window_reveal(stage);
+        assert_eq!((stage, step), (2, RevealStep::Wait));
+        let (_stage, step) = next_window_reveal(stage);
+        assert_eq!(step, RevealStep::Show);
     }
 }

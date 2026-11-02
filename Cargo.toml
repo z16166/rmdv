@@ -70,12 +70,13 @@ objc2-foundation = { version = "0.3", features = ["NSArray", "NSError", "NSFileM
 # screen in logical coordinates). 0.48 matches the version Winit pulls in.
 windows-sys = { version = "0.48", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# Reveal the hidden launch window (see app::lifecycle::reveal_window): the
-# HWND comes from the window's raw handle. 0.6 matches Iced's runtime.
+# Cloak and reveal the hidden launch window (see app::lifecycle): the HWND
+# comes from the window's raw handle. 0.6 matches Iced's runtime.
 raw-window-handle = "0.6"
 
 [features]

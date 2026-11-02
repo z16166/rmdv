@@ -129,6 +129,9 @@ pub enum Message {
     SetReadingWidth(crate::theme::ReadingWidth),
     /// Settings → Font: set the body font family; `None` uses Inter.
     SetFontFamily(Option<String>),
+    /// The Settings font menu opened or closed. While open, the page does
+    /// not take pointer moves.
+    FontMenuOpen(bool),
     /// The background OS font enumeration finished; the list is now ready.
     FontsLoaded(Vec<String>),
     /// The background check of whether the given body font family covers CJK

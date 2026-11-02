@@ -748,14 +748,18 @@ where
                             0.0,
                             size.0 + (line_height.0 - size.0) / 2.0,
                         );
+                    // Under the em box. `baseline` is the bottom of that box;
+                    // pulling the stroke back up by `0.08 * size` painted
+                    // through the lowest pixels of the glyphs.
+                    let underline_at = translation
+                        + Vector::new(0.0, underline_offset(size.0, line_height.0));
 
                     if span.underline || hover_underline {
                         for bounds in &regions {
                             renderer.fill_quad(
                                 renderer::Quad {
                                     bounds: Rectangle::new(
-                                        bounds.position() + baseline
-                                            - Vector::new(0.0, size.0 * 0.08),
+                                        bounds.position() + underline_at,
                                         Size::new(bounds.width, 1.0),
                                     ),
                                     ..Default::default()
@@ -1158,6 +1162,17 @@ where
     }
 }
 
+/// Distance from the top of the line box to the underline stroke.
+///
+/// The em box is centered in the line. The stroke sits one pixel under that
+/// box when the line has the room, so it does not cover the glyphs. A tight
+/// line keeps the stroke on the bottom edge of the line instead.
+pub(crate) fn underline_offset(font_size: f32, line_height: f32) -> f32 {
+    let em_bottom = (line_height + font_size) / 2.0;
+    let room = (line_height - em_bottom).max(0.0);
+    em_bottom + 1.0_f32.min(room)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout<Link, Renderer>(
     state: &mut State<Link>,
@@ -1369,4 +1384,25 @@ fn visual_lines_offset(line: usize, buffer: &cosmic_text::Buffer) -> i32 {
         .sum();
 
     visual_lines_offset as i32 * if scroll.line < line { 1 } else { -1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::underline_offset;
+
+    #[test]
+    fn underline_sits_at_or_below_the_em_box() {
+        for (size, line) in [(16.0, 16.0 * 1.5), (16.0, 16.0 * 1.3), (13.0, 13.0)] {
+            let em_bottom = (line + size) / 2.0;
+            let y = underline_offset(size, line);
+            assert!(
+                y >= em_bottom,
+                "size {size} line {line}: stroke at {y} enters the em box ending at {em_bottom}"
+            );
+            assert!(
+                y <= line,
+                "size {size} line {line}: stroke at {y} leaves the line box {line}"
+            );
+        }
+    }
 }

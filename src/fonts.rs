@@ -106,11 +106,16 @@ pub fn ensure_system_fonts_loaded() {
     });
 }
 
-/// Whether `family` shapes simplified AND traditional CJK text with its own
-/// faces at both body weights. When it does, the reader lets CJK runs keep
-/// the user's chosen family instead of pinning them to the bundled
-/// Noto Sans TC. Meant to run on a background worker: the first call pays
-/// the system font scan.
+/// Whether `family` draws CJK with its own regular face. When it does, the
+/// reader lets CJK runs keep the user's chosen family instead of pinning
+/// them to the bundled Noto Sans TC. Meant to run on a background worker:
+/// the first call pays the system font scan.
+///
+/// Regular weight only, and either a simplified or a traditional hanzi is
+/// enough. Bold faces are often registered under a second family name
+/// (`Microsoft YaHei Bold`), and requiring both weights and both characters
+/// rejected families that draw body text themselves. Those runs — often the
+/// first column of a table — then stayed on Noto Sans TC.
 pub fn family_covers_cjk(family: &str) -> bool {
     use iced::advanced::graphics::text::cosmic_text::{
         Attrs, Buffer, Family, Metrics, Shaping, Weight,
@@ -121,14 +126,14 @@ pub fn family_covers_cjk(family: &str) -> bool {
         return false;
     };
     let fonts = guard.raw();
-    [Weight::NORMAL, Weight::BOLD].iter().all(|&weight| {
-        // One simplified, one traditional hanzi: both must resolve to the
-        // chosen family, matching the bundled face's Big5 + GB2312 contract.
+    ["中", "體"].iter().any(|sample| {
         let mut buffer = Buffer::new(fonts, Metrics::new(16.0, 20.0));
         buffer.set_text(
             fonts,
-            "中體",
-            &Attrs::new().family(Family::Name(family)).weight(weight),
+            sample,
+            &Attrs::new()
+                .family(Family::Name(family))
+                .weight(Weight::NORMAL),
             Shaping::Advanced,
             None,
         );
@@ -211,6 +216,20 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn noto_sans_tc_draws_the_cjk_coverage_sample_at_regular_weight() {
+        // `family_covers_cjk` asks only this: regular weight, and either
+        // simplified 中 or traditional 體. Bold is a separate family name
+        // on many system fonts and must not fail the probe.
+        for sample in ["中", "體"] {
+            let families = shaped_families_in(super::CJK_FAMILY, sample, Weight::NORMAL);
+            assert!(
+                families.iter().all(|f| f == super::CJK_FAMILY),
+                "{sample} shaped with {families:?}"
+            );
+        }
     }
 
     #[test]

@@ -414,6 +414,11 @@ impl App {
             }
             Message::SettingsMove(delta) => self.settings_move(delta),
             Message::SettingsCursor(index) => {
+                // The font menu is an overlay. A move outside it must not
+                // retarget the settings cursor.
+                if self.font_menu_open {
+                    return Task::none();
+                }
                 self.settings_cursor = index.min(SettingsRow::visible().len() - 1);
                 Task::none()
             }
@@ -2373,10 +2378,15 @@ impl App {
                 }
                 let monitor = iced::window::monitor_size(id)
                     .map(move |monitor| Message::WindowMonitorSize(id, monitor));
-                Task::batch([mode, monitor, self.arm_window_reveal_fallback(id)])
+                Task::batch([
+                    mode,
+                    monitor,
+                    self.arm_window_reveal_fallback(id),
+                    self.advance_window_reveal(id),
+                ])
             }
-            Message::WindowFirstFrame(id) => self.reveal_window_if_needed(id),
-            Message::WindowRevealFallback(id) => self.reveal_window_if_needed(id),
+            Message::WindowFirstFrame(id) => self.advance_window_reveal(id),
+            Message::WindowRevealFallback(id) => self.force_window_reveal(id),
             Message::RefreshWindowModeSettled(id) => self.window_mode_settle_fired(id),
             Message::WindowModeChanged(mode) => {
                 self.window_fullscreen = matches!(mode, iced::window::Mode::Fullscreen);
@@ -2822,6 +2832,10 @@ impl App {
             }
             Message::SetReadingWidth(width) => self.set_reading_width(width),
             Message::SetFontFamily(family) => self.set_font_family(family),
+            Message::FontMenuOpen(open) => {
+                self.font_menu_open = open;
+                Task::none()
+            }
             Message::FontsLoaded(fonts) => {
                 self.fonts = Some(fonts);
                 // If the saved family is not in the loaded list, drop back to

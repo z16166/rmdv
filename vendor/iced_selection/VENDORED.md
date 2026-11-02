@@ -38,6 +38,9 @@ later commits add only what rmdv needs to select across reader blocks:
 - A double-click selects the word of the grapheme under the pointer (the
   hit's affinity tells which side of the caret it is), not the words on
   both sides of the caret.
+- Underlines sit just below the em box (`underline_offset`). Upstream draws
+  the stroke `0.08 * font_size` above the bottom of that box, which covers
+  the lowest pixels of the glyphs.
 
 Keep changes small and listed here so a later upstream release can replace
 this copy.

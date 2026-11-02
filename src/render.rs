@@ -51,7 +51,7 @@ fn cached_font_name(name: &str) -> &'static str {
 /// The body text font: the user's choice, or the bundled Inter. CJK glyphs
 /// fall back to the bundled Noto Sans TC automatically because cosmic-text
 /// shapes across all loaded faces.
-fn body_font() -> iced::Font {
+pub(crate) fn body_font() -> iced::Font {
     BODY_FONT.with(|f| f.get().unwrap_or_else(|| iced::Font::with_name("Inter")))
 }
 
@@ -1535,6 +1535,7 @@ fn render_list<'a>(
                     "•".to_string()
                 };
                 text(bullet)
+                    .font(body_font())
                     .color(pal.accent)
                     .size(typ.body_size)
                     .line_height(iced::widget::text::LineHeight::Relative(typ.line_height))

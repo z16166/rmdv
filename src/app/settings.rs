@@ -288,6 +288,8 @@ impl App {
     }
 
     pub(super) fn set_font_family(&mut self, family: Option<String>) -> Task<Message> {
+        // Choosing an item closes the menu. `on_close` does not fire then.
+        self.font_menu_open = false;
         // Validate against the loaded list when available: an uninstalled
         // name would render as the fallback anyway, so reject it early and
         // keep the previous choice. `None` (Inter) is always valid.

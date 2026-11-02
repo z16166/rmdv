@@ -62,7 +62,11 @@ fn selectable<'a>(
     };
     // Hover sends one message on entering a link and one on leaving it;
     // the app shows the destination while the pointer is on the link.
+    // The paragraph default is the reader's body font. A span that does not
+    // name a face, and cosmic-text's fallback for a missing glyph, then stay
+    // on the family from Settings instead of the bundled Inter.
     let mut text = iced_selection::rich_text(spans)
+        .font(crate::render::body_font())
         .on_link_click(|m| m)
         .on_link_enter(|m, source| match m {
             Message::OpenLink(url) => Message::LinkHovered(url, source),

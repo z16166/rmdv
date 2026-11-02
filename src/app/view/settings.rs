@@ -1,5 +1,6 @@
 //! The Settings page (⌘,): every user preference with its current value.
 
+use super::pointer_sink::PointerSink;
 use super::*;
 // Explicit import: the `column!` macro is otherwise ambiguous between the glob
 // import and iced's exported macro.
@@ -97,14 +98,18 @@ pub(in crate::app) fn settings_page<'a>(
     .direction(slim_scroll_direction())
     .style(move |_, status| sleek_scrollable_style(status, pal, true));
 
-    container(body)
+    let page = container(body)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_| container::Style {
             background: Some(fill.into()),
             ..Default::default()
-        })
-        .into()
+        });
+    if app.font_menu_open {
+        PointerSink::new(page).into()
+    } else {
+        page.into()
+    }
 }
 
 fn section_title(row: SettingsRow) -> &'static str {
@@ -313,6 +318,8 @@ fn settings_row_body<'a>(app: &'a App, row: SettingsRow, pal: Palette) -> Elemen
                     .menu_height(Length::Fixed(360.0))
                     .style(move |_, status| pick_list_style(status, pal))
                     .menu_style(move |_| pick_list_menu_style(pal))
+                    .on_open(Message::FontMenuOpen(true))
+                    .on_close(Message::FontMenuOpen(false))
                     .into()
                 }
             };
