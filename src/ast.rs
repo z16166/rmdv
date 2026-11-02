@@ -39,6 +39,19 @@ pub enum Block {
         hash: u64,
     },
     Rule,
+    /// Images that share a line (a paragraph of badges), wrapping when they
+    /// do not fit. Last, so the other variants keep the discriminants their
+    /// block ids hash.
+    ImageRow(Vec<ImageRef>),
+}
+
+/// One image of a `Block::ImageRow`, with the fields of a `Block::Image`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ImageRef {
+    pub url: String,
+    pub alt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]

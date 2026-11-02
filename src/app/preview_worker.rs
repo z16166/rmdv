@@ -9,6 +9,7 @@ pub(super) fn collect_preview_assets(
 ) {
     match block {
         Block::Image { url, .. } => images.push(url.clone()),
+        Block::ImageRow(row) => images.extend(row.iter().map(|image| image.url.clone())),
         Block::Diagram { hash, kind, source } => {
             diagrams.push((*hash, kind.clone(), source.clone()))
         }

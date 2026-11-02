@@ -39,6 +39,12 @@ fn block(b: &Block) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
         Block::Image { alt, .. } => alt.clone(),
+        Block::ImageRow(images) => images
+            .iter()
+            .map(|image| image.alt.as_str())
+            .filter(|alt| !alt.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
         Block::Diagram {
             kind: DiagramKind::Math,
             source,

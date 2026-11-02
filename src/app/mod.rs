@@ -1325,35 +1325,37 @@ impl App {
     /// byte-budgeted `image_cache` through `Message::ImageFetched`.
     fn prime_document_images(&mut self) -> Vec<Task<Message>> {
         let mut fetches: Vec<Task<Message>> = Vec::new();
-        for (_id, block) in &self.ast {
-            if let Block::Image { url, .. } = block {
-                if is_remote_url(url) {
-                    if !self.image_cache.contains_key(url) {
-                        self.image_cache.insert(url.clone(), ImageState::Loading);
-                        let url = url.clone();
-                        fetches.push(Task::perform(fetch_image(url), |(url, result)| {
-                            Message::ImageFetched(url, result)
-                        }));
-                    }
-                } else if let Some(key) = local_image_key(url, self.file.as_deref()) {
-                    // Read local images off the UI thread into the budgeted
-                    // cache, so `view()` never touches the filesystem. A
-                    // missing file is retried on the next load, because an
-                    // agent may write the image after the document.
-                    let cached = matches!(
-                        self.image_cache.get(&key),
-                        Some(
-                            ImageState::Loading
-                                | ImageState::Loaded(_)
-                                | ImageState::LoadedSvg { .. }
-                        )
-                    );
-                    if !cached {
-                        self.image_cache.insert(key.clone(), ImageState::Loading);
-                        fetches.push(Task::perform(read_local_image(key), |(key, result)| {
-                            Message::ImageFetched(key, result)
-                        }));
-                    }
+        let urls: Vec<String> = self
+            .ast
+            .iter()
+            .flat_map(|(_, block)| own_image_urls(block))
+            .map(str::to_string)
+            .collect();
+        for url in &urls {
+            if is_remote_url(url) {
+                if !self.image_cache.contains_key(url) {
+                    self.image_cache.insert(url.clone(), ImageState::Loading);
+                    let url = url.clone();
+                    fetches.push(Task::perform(fetch_image(url), |(url, result)| {
+                        Message::ImageFetched(url, result)
+                    }));
+                }
+            } else if let Some(key) = local_image_key(url, self.file.as_deref()) {
+                // Read local images off the UI thread into the budgeted
+                // cache, so `view()` never touches the filesystem. A
+                // missing file is retried on the next load, because an
+                // agent may write the image after the document.
+                let cached = matches!(
+                    self.image_cache.get(&key),
+                    Some(
+                        ImageState::Loading | ImageState::Loaded(_) | ImageState::LoadedSvg { .. }
+                    )
+                );
+                if !cached {
+                    self.image_cache.insert(key.clone(), ImageState::Loading);
+                    fetches.push(Task::perform(read_local_image(key), |(key, result)| {
+                        Message::ImageFetched(key, result)
+                    }));
                 }
             }
         }
@@ -2878,10 +2880,13 @@ impl App {
         let mut keep: HashSet<String> = self
             .ast
             .iter()
-            .filter_map(|(_, b)| match b {
-                Block::Image { url, .. } if is_remote_url(url) => Some(url.clone()),
-                Block::Image { url, .. } => local_image_key(url, self.file.as_deref()),
-                _ => None,
+            .flat_map(|(_, b)| own_image_urls(b))
+            .filter_map(|url| {
+                if is_remote_url(url) {
+                    Some(url.to_string())
+                } else {
+                    local_image_key(url, self.file.as_deref())
+                }
             })
             .chain(self.zoom_url.clone())
             .collect();
@@ -4408,8 +4413,27 @@ fn block_text_bytes(block: &Block) -> usize {
             .len()
             .saturating_add(alt.len())
             .saturating_add(link.as_ref().map_or(0, String::len)),
+        Block::ImageRow(images) => images
+            .iter()
+            .map(|image| {
+                image
+                    .url
+                    .len()
+                    .saturating_add(image.alt.len())
+                    .saturating_add(image.link.as_ref().map_or(0, String::len))
+            })
+            .sum(),
         Block::Diagram { source, .. } => source.len(),
         Block::Rule => 0,
+    }
+}
+
+/// The image URLs a top-level block shows itself.
+fn own_image_urls(block: &Block) -> Vec<&str> {
+    match block {
+        Block::Image { url, .. } => vec![url.as_str()],
+        Block::ImageRow(images) => images.iter().map(|image| image.url.as_str()).collect(),
+        _ => Vec::new(),
     }
 }
 

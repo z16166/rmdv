@@ -110,46 +110,189 @@ pub(super) const REMOTE_IMAGE_CONCURRENCY: usize = 4;
 
 /// One HTTP client for every image fetch, so TLS setup and pooled connections
 /// are reused. Iced drives all tasks on a single runtime, which the pool needs.
+///
+/// A connect that hangs is abandoned after `REMOTE_IMAGE_CONNECT_TIMEOUT`
+/// and retried: from some networks the first connection to a host stalls
+/// until the whole request times out, while the next one succeeds quickly.
 pub(super) static IMAGE_CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(REMOTE_IMAGE_CONNECT_TIMEOUT)
+            .timeout(REMOTE_IMAGE_TIMEOUT)
             .user_agent(concat!("rmdv/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| e.to_string())
     });
 
+const REMOTE_IMAGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const REMOTE_IMAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+const REMOTE_IMAGE_ATTEMPTS: u32 = 3;
+/// A cached remote image is used as-is for this long; after that a fresh
+/// download is tried, and the cached bytes are kept if the download fails.
+const REMOTE_IMAGE_CACHE_FRESH: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 pub(super) static IMAGE_FETCH_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(REMOTE_IMAGE_CONCURRENCY));
 
 pub(super) async fn fetch_image(url: String) -> (String, Result<Vec<u8>, String>) {
-    let res = async {
-        let client = IMAGE_CLIENT.as_ref().map_err(Clone::clone)?;
-        let _permit = IMAGE_FETCH_PERMITS
-            .acquire()
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("http {}", resp.status()));
+    if let Some(bytes) = cached_remote(&url, REMOTE_IMAGE_CACHE_FRESH).await {
+        return (url, Ok(bytes));
+    }
+    let mut last = String::from("image request failed");
+    for attempt in 0..REMOTE_IMAGE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300 * u64::from(attempt))).await;
         }
-        let too_large = || format!("image larger than {} MB", MAX_REMOTE_IMAGE_BYTES >> 20);
-        let declared = resp.content_length().unwrap_or(0) as usize;
-        if declared > MAX_REMOTE_IMAGE_BYTES {
+        match fetch_image_once(&url).await {
+            Ok(bytes) => {
+                store_cached_remote(&url, &bytes).await;
+                return (url, Ok(bytes));
+            }
+            Err(err) if err.retry && attempt + 1 < REMOTE_IMAGE_ATTEMPTS => last = err.message,
+            Err(err) => {
+                last = err.message;
+                break;
+            }
+        }
+    }
+    // A stale copy beats a blank failure when the host is unreachable.
+    if let Some(bytes) = cached_remote(&url, std::time::Duration::MAX).await {
+        return (url, Ok(bytes));
+    }
+    (url, Err(last))
+}
+
+struct FetchError {
+    message: String,
+    retry: bool,
+}
+
+async fn fetch_image_once(url: &str) -> Result<Vec<u8>, FetchError> {
+    let client = IMAGE_CLIENT.as_ref().map_err(|e| FetchError {
+        message: e.clone(),
+        retry: false,
+    })?;
+    let _permit = IMAGE_FETCH_PERMITS
+        .acquire()
+        .await
+        .map_err(|e| FetchError {
+            message: e.to_string(),
+            retry: false,
+        })?;
+    let mut resp = client.get(url).send().await.map_err(fetch_error)?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        return Err(FetchError {
+            message: format!("http {code}"),
+            retry: matches!(code, 408 | 429 | 500 | 502 | 503 | 504),
+        });
+    }
+    let too_large = || FetchError {
+        message: format!("image larger than {} MB", MAX_REMOTE_IMAGE_BYTES >> 20),
+        retry: false,
+    };
+    let declared = resp.content_length().unwrap_or(0) as usize;
+    if declared > MAX_REMOTE_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    // Stream so an undeclared or lying length still stops at the cap.
+    let mut bytes = Vec::with_capacity(declared);
+    while let Some(chunk) = resp.chunk().await.map_err(fetch_error)? {
+        if bytes.len() + chunk.len() > MAX_REMOTE_IMAGE_BYTES {
             return Err(too_large());
         }
-        // Stream so an undeclared or lying length still stops at the cap.
-        let mut bytes = Vec::with_capacity(declared);
-        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-            if bytes.len() + chunk.len() > MAX_REMOTE_IMAGE_BYTES {
-                return Err(too_large());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok::<Vec<u8>, String>(bytes)
+        bytes.extend_from_slice(&chunk);
     }
-    .await;
-    (url, res)
+    Ok(bytes)
+}
+
+/// Timeouts, dropped connections and transient HTTP statuses are worth
+/// another attempt. A 404 is not.
+fn fetch_error(err: reqwest::Error) -> FetchError {
+    let retry = err.is_timeout()
+        || err.is_connect()
+        || err.is_decode()
+        || err.is_request()
+        || matches!(
+            err.status().map(|status| status.as_u16()),
+            Some(408 | 429 | 500 | 502 | 503 | 504)
+        );
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    FetchError { message, retry }
+}
+
+fn remote_cache_path(url: &str) -> Option<std::path::PathBuf> {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(
+        dirs::cache_dir()?
+            .join("rmdv")
+            .join("images")
+            .join(format!("{hash:016x}-{}", url.len())),
+    )
+}
+
+/// `max_age` bounds how old a cached download may be. `Duration::MAX` keeps
+/// any age, which is the fallback when a fresh download fails.
+async fn cached_remote(url: &str, max_age: std::time::Duration) -> Option<Vec<u8>> {
+    let path = remote_cache_path(url)?;
+    let meta = tokio::fs::metadata(&path).await.ok()?;
+    if meta
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > max_age)
+    {
+        return None;
+    }
+    decode_cached_remote(&tokio::fs::read(&path).await.ok()?, url)
+}
+
+fn decode_cached_remote(data: &[u8], url: &str) -> Option<Vec<u8>> {
+    let len = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    let rest = data.get(4..)?;
+    let (stored, bytes) = rest.split_at_checked(len)?;
+    if stored != url.as_bytes() || bytes.is_empty() {
+        return None;
+    }
+    Some(bytes.to_vec())
+}
+
+async fn store_cached_remote(url: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let Some(path) = remote_cache_path(url) else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if tokio::fs::create_dir_all(dir).await.is_err() {
+        return;
+    }
+    let mut payload = Vec::with_capacity(4 + url.len() + bytes.len());
+    payload.extend_from_slice(&(url.len() as u32).to_le_bytes());
+    payload.extend_from_slice(url.as_bytes());
+    payload.extend_from_slice(bytes);
+    let tmp = path.with_extension("tmp");
+    if tokio::fs::write(&tmp, &payload).await.is_err() {
+        return;
+    }
+    // Windows refuses to rename over a file that already exists.
+    let _ = tokio::fs::remove_file(&path).await;
+    if tokio::fs::rename(&tmp, &path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
 }
 
 /// Local images larger than this are not loaded.
@@ -203,6 +346,67 @@ pub fn rasterize_svg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
         &mut pixmap.as_mut(),
     );
     Ok((pixmap.take(), pw, ph))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_test_url() -> String {
+        format!(
+            "http://127.0.0.1:1/rmdv-image-cache-{}-{}",
+            std::process::id(),
+            REMOTE_IMAGE_CACHE_FRESH.as_secs()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cached_image_is_reused_without_connecting() {
+        let url = cache_test_url();
+        let bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
+        store_cached_remote(&url, &bytes).await;
+        let (_, got) = fetch_image(url.clone()).await;
+        let _ = tokio::fs::remove_file(remote_cache_path(&url).unwrap()).await;
+        assert_eq!(got.as_deref(), Ok(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn a_stale_cached_image_is_kept_when_the_download_fails() {
+        let url = format!("{}-stale", cache_test_url());
+        let bytes = b"png".to_vec();
+        store_cached_remote(&url, &bytes).await;
+        let path = remote_cache_path(&url).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 60 * 60),
+        )
+        .unwrap();
+        drop(file);
+        let started = std::time::Instant::now();
+        let (_, got) = fetch_image(url).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(got.as_deref(), Ok(bytes.as_slice()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "a refused connection is not retried until the request timeout"
+        );
+    }
+
+    #[test]
+    fn a_cache_entry_for_another_url_is_ignored() {
+        let data = {
+            let url = "https://example.test/a.png";
+            let mut data = (url.len() as u32).to_le_bytes().to_vec();
+            data.extend_from_slice(url.as_bytes());
+            data.extend_from_slice(b"image");
+            data
+        };
+        assert!(decode_cached_remote(&data, "https://example.test/b.png").is_none());
+        assert_eq!(
+            decode_cached_remote(&data, "https://example.test/a.png").as_deref(),
+            Some(&b"image"[..])
+        );
+    }
 }
 
 pub fn is_svg_bytes(b: &[u8]) -> bool {

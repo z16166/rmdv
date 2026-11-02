@@ -1,7 +1,9 @@
-use crate::ast::{Block, BlockId, DiagramKind, Inline, ListItem};
+use crate::ast::{Block, BlockId, DiagramKind, ImageRef, Inline, ListItem};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
+
+mod html;
 
 pub fn parse(src: &str) -> (Vec<(BlockId, Block)>, Vec<u32>) {
     let src = strip_frontmatter(src);
@@ -462,6 +464,13 @@ fn fmt_block_for_hash<H: Hasher>(b: &Block, h: &mut H) {
             alt.hash(h);
             link.hash(h);
         }
+        Block::ImageRow(images) => {
+            for image in images {
+                image.url.hash(h);
+                image.alt.hash(h);
+                image.link.hash(h);
+            }
+        }
         Block::Blockquote(blocks) => {
             for x in blocks {
                 fmt_block_for_hash(x, h);
@@ -530,9 +539,14 @@ struct ParseState {
     /// Set when `mask_currency_dollars` replaced non-math `$` signs; `handle`
     /// turns them back into `$`.
     dollar_marker: Option<char>,
-    /// The open paragraph held an image. Images become their own blocks, so
-    /// a paragraph left with only the spaces between badges is dropped.
-    image_in_paragraph: bool,
+    /// Images the open paragraph held. Images become their own blocks, so a
+    /// paragraph left with only the spaces between badges is dropped, and
+    /// its images share a row.
+    paragraph_images: usize,
+    /// Frames opened by inline HTML tags, with the stack depth each sits at.
+    /// Their end tags close them; the markdown element around them closes
+    /// any left open.
+    html_frames: Vec<(usize, html::InlineTag)>,
 }
 
 enum Frame {
@@ -578,6 +592,10 @@ enum Frame {
         current_row: Vec<Vec<Inline>>,
         current_cell: Vec<Inline>,
     },
+    /// The raw text of an HTML block, mapped to blocks when it ends.
+    HtmlBlock(String),
+    /// Inline `<code>`/`<kbd>`: its text becomes an inline code span.
+    HtmlCode(String),
 }
 
 impl ParseState {
@@ -637,6 +655,12 @@ impl ParseState {
                 let s = self.clean_synthetic_marker(s.into_string());
                 self.push_inline(Inline::Text(format!("${}$", s)), offset, true)
             }
+            Event::Html(s) => {
+                if let Some(Frame::HtmlBlock(raw)) = self.stack.last_mut() {
+                    raw.push_str(&s);
+                }
+            }
+            Event::InlineHtml(s) => self.inline_html(&s, offset),
             Event::Rule => self.push_block(Block::Rule),
             Event::TaskListMarker(checked) => {
                 if let Some(Frame::Item { task, .. }) = self.stack.last_mut() {
@@ -656,7 +680,7 @@ impl ParseState {
                 });
             }
             Tag::Paragraph => {
-                self.image_in_paragraph = false;
+                self.paragraph_images = 0;
                 self.stack.push(Frame::Paragraph {
                     inlines: Vec::new(),
                     offset: Some(offset),
@@ -697,23 +721,7 @@ impl ParseState {
             Tag::Image { dest_url, .. } => {
                 let url = self.clean_synthetic_marker(dest_url.into_string());
                 // A badge: the image is (part of) a link's content.
-                let link = self
-                    .stack
-                    .iter()
-                    .rev()
-                    .take_while(|frame| {
-                        matches!(
-                            frame,
-                            Frame::Emph(_)
-                                | Frame::Strong(_)
-                                | Frame::Strike(_)
-                                | Frame::Link { .. }
-                        )
-                    })
-                    .find_map(|frame| match frame {
-                        Frame::Link { url, .. } => Some(url.clone()),
-                        _ => None,
-                    });
+                let link = self.enclosing_link();
                 self.stack.push(Frame::Image {
                     url,
                     alt: String::new(),
@@ -732,11 +740,13 @@ impl ParseState {
                     *in_head = true;
                 }
             }
+            Tag::HtmlBlock => self.stack.push(Frame::HtmlBlock(String::new())),
             _ => {}
         }
     }
 
     fn end(&mut self, tag: TagEnd, offset: u32) {
+        self.close_html_frames(offset);
         match tag {
             TagEnd::TableCell => {
                 if let Some(Frame::Table {
@@ -776,9 +786,110 @@ impl ParseState {
         let Some(frame) = self.stack.pop() else {
             return;
         };
+        self.html_frames
+            .retain(|(depth, _)| *depth <= self.stack.len());
+        self.finish_frame(frame, offset);
+    }
+
+    /// Close the inline HTML styles still open on top of the stack: the
+    /// markdown element around them is ending.
+    fn close_html_frames(&mut self, offset: u32) {
+        while self
+            .html_frames
+            .last()
+            .is_some_and(|(depth, _)| *depth == self.stack.len())
+        {
+            self.html_frames.pop();
+            if let Some(frame) = self.stack.pop() {
+                self.finish_frame(frame, offset);
+            }
+        }
+    }
+
+    /// Inline HTML inside markdown text: styles open and close frames like
+    /// their markdown counterparts, `<br>` breaks the line, and `<img>` is
+    /// an image.
+    fn inline_html(&mut self, raw: &str, offset: u32) {
+        for token in html::tokenize(raw) {
+            match token {
+                html::Token::Text(text) => self.push_inline(Inline::Text(text), offset, true),
+                html::Token::Start { name, attrs } => {
+                    if let Some(tag) = html::InlineTag::open(&name, &attrs) {
+                        let frame = match &tag {
+                            html::InlineTag::Strong => Frame::Strong(Vec::new()),
+                            html::InlineTag::Emph => Frame::Emph(Vec::new()),
+                            html::InlineTag::Strike => Frame::Strike(Vec::new()),
+                            html::InlineTag::Code => Frame::HtmlCode(String::new()),
+                            html::InlineTag::Link(url) => Frame::Link {
+                                url: url.clone(),
+                                children: Vec::new(),
+                            },
+                        };
+                        self.stack.push(frame);
+                        self.html_frames.push((self.stack.len(), tag));
+                    } else if name == "br" {
+                        self.push_inline(Inline::Text("\n".into()), offset, false);
+                    } else if name == "img" {
+                        if let Some((url, alt)) = html::image(&attrs) {
+                            let link = self.enclosing_link();
+                            self.finish_frame(Frame::Image { url, alt, link }, offset);
+                        }
+                    }
+                }
+                html::Token::End(name) => {
+                    let open = self
+                        .html_frames
+                        .iter()
+                        .any(|(depth, tag)| *depth <= self.stack.len() && tag.closed_by(&name));
+                    while open
+                        && self
+                            .html_frames
+                            .last()
+                            .is_some_and(|(depth, _)| *depth == self.stack.len())
+                    {
+                        let (_, tag) = self.html_frames.pop().expect("checked above");
+                        if let Some(frame) = self.stack.pop() {
+                            self.finish_frame(frame, offset);
+                        }
+                        if tag.closed_by(&name) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The link an image sits in, through any emphasis around it (a badge).
+    fn enclosing_link(&self) -> Option<String> {
+        self.stack
+            .iter()
+            .rev()
+            .take_while(|frame| {
+                matches!(
+                    frame,
+                    Frame::Emph(_)
+                        | Frame::Strong(_)
+                        | Frame::Strike(_)
+                        | Frame::HtmlCode(_)
+                        | Frame::Link { .. }
+                )
+            })
+            .find_map(|frame| match frame {
+                Frame::Link { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+    }
+
+    fn finish_frame(&mut self, frame: Frame, offset: u32) {
         let images_only = match &frame {
             Frame::Paragraph { inlines, .. } => {
-                std::mem::take(&mut self.image_in_paragraph) && is_blank(inlines)
+                let images = std::mem::take(&mut self.paragraph_images);
+                let images_only = images > 0 && is_blank(inlines);
+                if images_only && images > 1 {
+                    self.join_image_row(images);
+                }
+                images_only
             }
             _ => false,
         };
@@ -814,7 +925,7 @@ impl ParseState {
                     .iter()
                     .any(|frame| matches!(frame, Frame::Paragraph { .. }))
                 {
-                    self.image_in_paragraph = true;
+                    self.paragraph_images += 1;
                 }
                 // A heading keeps the alt text as its title (and anchor),
                 // as it did before images became their own blocks.
@@ -875,6 +986,12 @@ impl ParseState {
             Frame::Table { headers, rows, .. } => {
                 self.push_block(Block::Table { headers, rows });
             }
+            Frame::HtmlBlock(raw) => {
+                for block in html::blocks(&raw) {
+                    self.push_block(block);
+                }
+            }
+            Frame::HtmlCode(code) => self.push_inline(Inline::Code(code), offset, true),
         }
     }
 
@@ -907,6 +1024,7 @@ impl ParseState {
                     }
                 }
                 Frame::Item { loose_inlines, .. } => loose_inlines.push(inl),
+                Frame::HtmlCode(code) => stringify_inline(&inl, code),
                 _ => {}
             }
         }
@@ -952,6 +1070,34 @@ impl ParseState {
                 blocks.push(b);
             }
             _ => self.blocks.push(b),
+        }
+    }
+
+    /// Join the last `count` blocks of the image's container, the images of
+    /// one paragraph, into a row.
+    fn join_image_row(&mut self, count: usize) {
+        let container = self
+            .stack
+            .iter()
+            .rposition(|frame| matches!(frame, Frame::Blockquote(_) | Frame::Item { .. }));
+        let blocks = match container.map(|i| &mut self.stack[i]) {
+            Some(Frame::Blockquote(blocks)) | Some(Frame::Item { blocks, .. }) => blocks,
+            _ => &mut self.blocks,
+        };
+        let Some(start) = blocks.len().checked_sub(count) else {
+            return;
+        };
+        if !blocks[start..]
+            .iter()
+            .all(|b| matches!(b, Block::Image { .. }))
+        {
+            return;
+        }
+        let row = image_row(blocks.drain(start..));
+        blocks.push(row);
+        if container.is_none() {
+            // The row keeps its first image's source offset.
+            self.offsets.truncate(self.blocks.len());
         }
     }
 
@@ -1025,6 +1171,19 @@ impl ParseState {
             }
         }
     }
+}
+
+/// One row of `Block::Image`s; other blocks are skipped.
+fn image_row(images: impl IntoIterator<Item = Block>) -> Block {
+    Block::ImageRow(
+        images
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::Image { url, alt, link } => Some(ImageRef { url, alt, link }),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn strip_frontmatter(src: &str) -> &str {
@@ -1107,6 +1266,95 @@ fn slugify(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readme_html_blocks_render_as_headings_images_and_paragraphs() {
+        let got = blocks_of(
+            "<p align=\"center\">\n  <img src=\"logo.svg\" alt=\"Logo\" width=\"340\">\n</p>\n\n\
+             <h3 align=\"center\">Run it locally.</h3>\n\n\
+             **Free.** Use it.\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                Block::Image {
+                    url: "logo.svg".into(),
+                    alt: "Logo".into(),
+                    link: None,
+                },
+                Block::Heading {
+                    level: 3,
+                    id: "run-it-locally".into(),
+                    inlines: vec![Inline::Text("Run it locally.".into())],
+                },
+                Block::Paragraph(vec![
+                    Inline::Strong(vec![Inline::Text("Free.".into())]),
+                    Inline::Text(" Use it.".into()),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_html_styles_links_breaks_and_images_inside_markdown() {
+        let got = blocks_of(
+            "Press <kbd>Ctrl</kbd>, <b>bold</b> and <a href=\"x.md\">link</a><br>next \
+             <a href=\"https://ci\"><img src=\"badge.svg\" alt=\"CI\"></a>\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                Block::Image {
+                    url: "badge.svg".into(),
+                    alt: "CI".into(),
+                    link: Some("https://ci".into()),
+                },
+                Block::Paragraph(vec![
+                    Inline::Text("Press ".into()),
+                    Inline::Code("Ctrl".into()),
+                    Inline::Text(", ".into()),
+                    Inline::Strong(vec![Inline::Text("bold".into())]),
+                    Inline::Text(" and ".into()),
+                    Inline::Link {
+                        url: "x.md".into(),
+                        children: vec![Inline::Text("link".into())],
+                    },
+                    Inline::Text("\n".into()),
+                    Inline::Text("next ".into()),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn unclosed_inline_html_ends_with_its_paragraph() {
+        let got = blocks_of("- a <b>open\n- b </i>stray\n\nafter\n");
+        assert_eq!(
+            got,
+            vec![
+                Block::List {
+                    ordered: false,
+                    items: vec![
+                        ListItem {
+                            task: None,
+                            blocks: vec![Block::Paragraph(vec![
+                                Inline::Text("a ".into()),
+                                Inline::Strong(vec![Inline::Text("open".into())]),
+                            ])],
+                        },
+                        ListItem {
+                            task: None,
+                            blocks: vec![Block::Paragraph(vec![
+                                Inline::Text("b ".into()),
+                                Inline::Text("stray".into()),
+                            ])],
+                        },
+                    ],
+                },
+                Block::Paragraph(vec![Inline::Text("after".into())]),
+            ]
+        );
+    }
 
     /// Collect the rendered (text) content of every Strong span in the parse.
     fn strong_texts(src: &str) -> Vec<String> {
@@ -1419,6 +1667,10 @@ mod tests {
                 Block::Image { url, alt, link } => {
                     out.push((url.clone(), alt.clone(), link.clone()))
                 }
+                Block::ImageRow(row) => out.extend(
+                    row.iter()
+                        .map(|i| (i.url.clone(), i.alt.clone(), i.link.clone())),
+                ),
                 Block::Blockquote(inner) => out.extend(images(inner)),
                 Block::List { items, .. } => {
                     for item in items {
@@ -1483,11 +1735,47 @@ mod tests {
                 image("b.svg", "b", Some("https://b.example")),
             ]
         );
+        assert!(
+            matches!(&blocks[0], Block::ImageRow(row) if row.len() == 2),
+            "the badges share one row"
+        );
         assert_eq!(
-            blocks[2..],
+            blocks[1..],
             [Block::Paragraph(vec![Inline::Text("After.".into())])],
             "no blank paragraph is left between the badges"
         );
+    }
+
+    #[test]
+    fn badge_rows_keep_one_source_offset_and_stay_apart_from_other_paragraphs() {
+        let src = "Intro\n\n![a](a.svg) ![b](b.svg)\n![c](c.svg)\n\n![d](d.svg)\n\n> ![e](e.svg) ![f](f.svg)\n";
+        let (blocks, offsets) = parse(src);
+        let shapes: Vec<&str> = blocks
+            .iter()
+            .map(|(_, b)| match b {
+                Block::Paragraph(_) => "p",
+                Block::ImageRow(row) if row.len() == 3 => "row3",
+                Block::Image { .. } => "img",
+                Block::Blockquote(inner)
+                    if matches!(inner[..], [Block::ImageRow(ref row)] if row.len() == 2) =>
+                {
+                    "quote-row2"
+                }
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(shapes, ["p", "row3", "img", "quote-row2"]);
+        assert_eq!(offsets.len(), blocks.len());
+        assert_eq!(&src[offsets[1] as usize..][..4], "![a]");
+        assert_eq!(&src[offsets[2] as usize..][..4], "![d]");
+    }
+
+    #[test]
+    fn images_with_text_between_them_stay_separate_blocks() {
+        let blocks = blocks_of("![a](a.svg) and ![b](b.svg)\n");
+        assert!(matches!(blocks[0], Block::Image { .. }));
+        assert!(matches!(blocks[1], Block::Image { .. }));
+        assert!(matches!(blocks[2], Block::Paragraph(_)));
     }
 
     #[test]

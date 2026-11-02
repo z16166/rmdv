@@ -98,6 +98,12 @@ fn fmt_block_for_hash<H: Hasher>(b: &Block, h: &mut H) {
             url.hash(h);
             alt.hash(h);
         }
+        Block::ImageRow(images) => {
+            for image in images {
+                image.url.hash(h);
+                image.alt.hash(h);
+            }
+        }
         Block::Blockquote(blocks) => {
             for x in blocks {
                 fmt_block_for_hash(x, h);

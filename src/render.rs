@@ -816,9 +816,35 @@ fn render_block<'a>(
                     key: image_key(url, current_file),
                     link: link.clone(),
                 },
-                render_image(url, alt, link.as_deref(), pal, img),
+                render_image(url, alt, link.as_deref(), Length::Fill, pal, img),
             )
             .into()
+        }
+        Block::ImageRow(images) => {
+            let current_file = img.current_file;
+            let marked = images.iter().map(|image| {
+                TargetMark::new(
+                    move || ReaderTarget::Image {
+                        key: image_key(&image.url, current_file),
+                        link: image.link.clone(),
+                    },
+                    render_image(
+                        &image.url,
+                        &image.alt,
+                        image.link.as_deref(),
+                        Length::Shrink,
+                        pal,
+                        img,
+                    ),
+                )
+                .into()
+            });
+            iced::widget::Row::with_children(marked)
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+                .wrap()
+                .vertical_spacing(4)
+                .into()
         }
         Block::Rule => {
             let pal_r = *pal;
@@ -1196,10 +1222,23 @@ fn push_span<'a>(
     }
 }
 
+/// Placeholder while a remote image is loading or after it failed. The URL
+/// is left out: badge addresses are long enough to wrap the whole row.
+fn image_status(kind: &str, alt: &str) -> String {
+    if alt.is_empty() {
+        format!("[{kind}]")
+    } else {
+        format!("[{kind}: {alt}]")
+    }
+}
+
+/// `svg_width` sizes an SVG: `Fill` scales it to the column, `Shrink` keeps
+/// its own size so it can share a row.
 fn render_image<'a>(
     url: &'a str,
     alt: &'a str,
     link: Option<&'a str>,
+    svg_width: Length,
     pal: &Palette,
     img: &ImgCtx<'a>,
 ) -> Element<'a, Message> {
@@ -1221,11 +1260,12 @@ fn render_image<'a>(
             Some(ImageState::Loaded(h)) => {
                 clickable(image_widget(h.clone()).into(), url.to_string())
             }
-            Some(ImageState::LoadedSvg { svg, .. }) => {
-                clickable(svg_widget(svg.clone()).into(), url.to_string())
-            }
-            Some(ImageState::Failed) => placeholder(format!("[image failed: {alt} ({url})]")),
-            _ => placeholder(format!("[loading: {alt} ({url})]")),
+            Some(ImageState::LoadedSvg { svg, .. }) => clickable(
+                svg_widget(svg.clone()).width(svg_width).into(),
+                url.to_string(),
+            ),
+            Some(ImageState::Failed) => placeholder(image_status("image failed", alt)),
+            _ => placeholder(image_status("loading", alt)),
         }
     } else {
         // The open document's local images are read into the cache by a
@@ -1237,7 +1277,7 @@ fn render_image<'a>(
         match img.cache.get(&key) {
             Some(ImageState::Loaded(h)) => clickable(image_widget(h.clone()).into(), key),
             Some(ImageState::LoadedSvg { svg, .. }) => {
-                clickable(svg_widget(svg.clone()).into(), key)
+                clickable(svg_widget(svg.clone()).width(svg_width).into(), key)
             }
             Some(ImageState::Failed) => placeholder(format!("[image missing: {alt} ({url})]")),
             Some(ImageState::Loading) => placeholder(format!("[loading: {alt} ({url})]")),
@@ -1250,7 +1290,9 @@ fn render_image<'a>(
                     .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
                 if is_svg {
                     clickable(
-                        svg_widget(iced::widget::svg::Handle::from_path(p)).into(),
+                        svg_widget(iced::widget::svg::Handle::from_path(p))
+                            .width(svg_width)
+                            .into(),
                         key,
                     )
                 } else {
