@@ -153,6 +153,51 @@ pub fn family_covers_cjk(family: &str) -> bool {
     })
 }
 
+/// The weight to ask for so `family` still draws the text. cosmic-text keeps
+/// a run in the requested family only when that family has a face of exactly
+/// the requested weight, and it never synthesizes bold. Bold text in a
+/// single-weight family therefore came out in some other family's bold face.
+/// The nearest weight the family has keeps the chosen typeface instead.
+///
+/// Faces are looked up once per family; the first call for a family takes
+/// the font system lock, so it runs on the UI thread only from `view`.
+pub fn drawable_weight(family: &str, wanted: u16) -> u16 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static WEIGHTS: OnceLock<Mutex<HashMap<String, Vec<u16>>>> = OnceLock::new();
+    let cache = WEIGHTS.get_or_init(Default::default);
+    let Ok(mut cache) = cache.lock() else {
+        return wanted;
+    };
+    if !cache.contains_key(family) {
+        ensure_system_fonts_loaded();
+        let fs = iced::advanced::graphics::text::font_system();
+        let Ok(mut guard) = fs.write() else {
+            return wanted;
+        };
+        let weights = guard
+            .raw()
+            .db()
+            .faces()
+            .filter(|face| face.families.iter().any(|(name, _)| name == family))
+            .map(|face| face.weight.0)
+            .collect();
+        cache.insert(family.to_owned(), weights);
+    }
+    nearest_weight(&cache[family], wanted)
+}
+
+/// The weight in `available` closest to `wanted`, the heavier one on a tie.
+/// `wanted` itself when the family has no faces at all (it falls back
+/// anyway).
+fn nearest_weight(available: &[u16], wanted: u16) -> u16 {
+    available
+        .iter()
+        .copied()
+        .min_by_key(|&weight| (weight.abs_diff(wanted), std::cmp::Reverse(weight)))
+        .unwrap_or(wanted)
+}
+
 /// Enumerate the OS font families available to Iced's text shaper. Meant to
 /// run on a background worker (the caller wraps it in `Task::perform`): the
 /// first call loads the system font list, which takes a few hundred
@@ -230,6 +275,21 @@ mod tests {
                 "{sample} shaped with {families:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_missing_weight_resolves_to_the_nearest_face_of_the_family() {
+        // A single-weight family keeps drawing bold text.
+        assert_eq!(super::nearest_weight(&[400], 700), 400);
+        assert_eq!(super::nearest_weight(&[300, 400], 700), 400);
+        // A tie goes to the heavier face.
+        assert_eq!(super::nearest_weight(&[400, 600], 500), 600);
+        assert_eq!(super::nearest_weight(&[400, 700], 700), 700);
+        // An unknown family keeps the request.
+        assert_eq!(super::nearest_weight(&[], 700), 700);
+        // The bundled faces have the weights the reader asks for.
+        assert_eq!(super::drawable_weight(super::CJK_FAMILY, 700), 700);
+        assert_eq!(super::drawable_weight("Inter", 700), 700);
     }
 
     #[test]

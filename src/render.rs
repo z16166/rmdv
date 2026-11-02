@@ -55,6 +55,34 @@ pub(crate) fn body_font() -> iced::Font {
     BODY_FONT.with(|f| f.get().unwrap_or_else(|| iced::Font::with_name("Inter")))
 }
 
+/// `font.weight`, or the nearest weight its named family has. See
+/// [`crate::fonts::drawable_weight`].
+fn drawable_weight(font: iced::Font) -> iced::font::Weight {
+    use iced::font::Weight;
+    let iced::font::Family::Name(family) = font.family else {
+        return font.weight;
+    };
+    const WEIGHTS: [(Weight, u16); 9] = [
+        (Weight::Thin, 100),
+        (Weight::ExtraLight, 200),
+        (Weight::Light, 300),
+        (Weight::Normal, 400),
+        (Weight::Medium, 500),
+        (Weight::Semibold, 600),
+        (Weight::Bold, 700),
+        (Weight::ExtraBold, 800),
+        (Weight::Black, 900),
+    ];
+    let Some(&(_, wanted)) = WEIGHTS.iter().find(|(w, _)| *w == font.weight) else {
+        return font.weight;
+    };
+    let drawn = crate::fonts::drawable_weight(family, wanted);
+    WEIGHTS
+        .iter()
+        .min_by_key(|(_, value)| value.abs_diff(drawn))
+        .map_or(font.weight, |&(weight, _)| weight)
+}
+
 /// Whether the chosen body font covers CJK itself; CJK runs then keep it
 /// instead of the bundled Noto Sans TC.
 fn body_font_covers_cjk() -> bool {
@@ -983,6 +1011,7 @@ fn make_span<'a>(
     if st.bold {
         font.weight = iced::font::Weight::Bold;
     }
+    font.weight = drawable_weight(font);
     let mut s = span(text_str).size(size).font(font);
     if st.strike {
         s = s.strikethrough(true);

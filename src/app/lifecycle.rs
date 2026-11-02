@@ -83,7 +83,16 @@ pub fn launch_window_settings(
     saved: Option<crate::window_frame::WindowFrame>,
 ) -> iced::window::Settings {
     let screens = saved.and_then(|_| crate::window_frame::visible_screens());
-    window_settings_restored(transparent, saved.as_ref(), screens.as_deref())
+    #[allow(unused_mut)]
+    let mut settings = window_settings_restored(transparent, saved.as_ref(), screens.as_deref());
+    // Windows: winit maximizes a new window with `ShowWindow(SW_MAXIMIZE)`
+    // and hides it again, which shows the bare frame before the window is
+    // cloaked. The reveal maximizes it under the cloak instead.
+    #[cfg(target_os = "windows")]
+    {
+        settings.maximized = false;
+    }
+    settings
 }
 
 /// [`window_settings`] with `saved` restored against `screens`.
@@ -199,12 +208,12 @@ impl App {
             let (stage, step) = next_window_reveal(self.window_reveal_stage);
             self.window_reveal_stage = stage;
             match step {
-                RevealStep::Cloak => cloak_show_window(id),
+                RevealStep::Cloak => cloak_show_window(id, self.window_maximized),
                 RevealStep::Wait => redraw_window(id),
                 RevealStep::Show => {
                     self.window_revealed = true;
                     self.window_reveal_fallback_armed = false;
-                    uncloak_window(id)
+                    uncloak_window(id, self.window_maximized)
                 }
             }
         }
@@ -226,7 +235,7 @@ impl App {
             self.window_revealed = true;
             self.window_reveal_stage = 3;
             self.window_reveal_fallback_armed = false;
-            uncloak_window(id)
+            uncloak_window(id, self.window_maximized)
         }
     }
 
@@ -441,15 +450,17 @@ fn set_cloaked(hwnd: windows_sys::Win32::Foundation::HWND, cloaked: bool) {
 }
 
 /// Show the window while cloaked and ask it to paint. The cloak is set
-/// before `ShowWindow`, so the border is never composited on its own.
+/// before `ShowWindow`, so the border is never composited on its own. A
+/// window saved maximized is maximized here (see `launch_window_settings`).
 #[cfg(target_os = "windows")]
-fn cloak_show_window(id: iced::window::Id) -> Task<Message> {
-    with_hwnd(id, |hwnd| {
+fn cloak_show_window(id: iced::window::Id, maximized: bool) -> Task<Message> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, SW_SHOWMAXIMIZED};
+    with_hwnd(id, move |hwnd| {
         set_cloaked(hwnd, true);
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
                 hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW },
             );
             windows_sys::Win32::Graphics::Gdi::RedrawWindow(
                 hwnd,
@@ -476,13 +487,14 @@ fn redraw_window(id: iced::window::Id) -> Task<Message> {
 /// Lift the cloak. The window is already shown, so this reveals the frame
 /// DWM has already composited.
 #[cfg(target_os = "windows")]
-fn uncloak_window(id: iced::window::Id) -> Task<Message> {
-    with_hwnd(id, |hwnd| {
+fn uncloak_window(id: iced::window::Id, maximized: bool) -> Task<Message> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, SW_SHOWMAXIMIZED};
+    with_hwnd(id, move |hwnd| {
         set_cloaked(hwnd, false);
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
                 hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW },
             );
         }
     })
