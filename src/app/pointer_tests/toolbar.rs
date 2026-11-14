@@ -59,7 +59,16 @@ fn toolbar_setting_row_has_a_clickable_segmented_control() {
     }
     let on_hover = at.expect("the Toolbar row shows an On hover segment");
     assert!(ui.text_bounds(&app, "Always").is_some(), "and Always");
+    eprintln!(
+        "DEBUG on_hover={on_hover:?} always={:?} toolbar={:?}",
+        ui.text_bounds(&app, "Always"),
+        ui.text_bounds(&app, "Toolbar")
+    );
     let messages = ui.click(&app, center(on_hover));
+    eprintln!(
+        "DEBUG after={:?} messages={messages:?}",
+        ui.text_bounds(&app, "On hover")
+    );
     assert!(
         has(&messages, |m| matches!(
             m,
