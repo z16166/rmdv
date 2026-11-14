@@ -198,10 +198,12 @@ fn settle(app: &mut App, ui: &mut PointerUi) {
 }
 
 /// Sweeps the pointer over the window until a link reports the pointer;
-/// returns where.
+/// returns where. The sweep starts at the window's left edge because the
+/// reader column is centered: with the sidebar closed a short link can sit
+/// left of x=200.
 fn find_link(app: &App, ui: &mut PointerUi) -> Option<(Point, Vec<Message>)> {
     for y in (60..400).step_by(6) {
-        for x in (200..1200).step_by(24) {
+        for x in (0..WINDOW.width as i32).step_by(16) {
             let at = Point::new(x as f32, y as f32);
             let (messages, _) = ui.move_to(app, at);
             if messages
