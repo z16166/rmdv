@@ -97,6 +97,12 @@ jobs:
           if ($dynamic) { throw "dynamic MSVC runtime import: $dynamic" }
           Write-Host "OK: MSVC runtime is statically linked"
 
+          $headers = & dumpbin /nologo /headers $exe
+          if (!($headers -match 'Windows GUI')) {
+            throw "expected the Windows GUI subsystem so no console window opens"
+          }
+          Write-Host "OK: Windows GUI subsystem"
+
       - name: Package zip
         shell: pwsh
         run: |

@@ -1,3 +1,7 @@
+// Release builds are GUI binaries on Windows, so launching rmdv never flashes
+// a console window. Debug builds keep the console for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use rmdv::app::App;
 use rmdv::cli::{parse_from, ParsedCli, Stateless};
 use rmdv::ipc;
@@ -5,6 +9,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> iced::Result {
+    // A GUI-subsystem process has no console of its own. When the CLI is run
+    // from a terminal, join that terminal so command output still appears.
+    #[cfg(windows)]
+    attach_parent_console();
+
     let t0 = Instant::now();
     rmdv::bench::set_process_start(t0);
 
@@ -55,6 +64,17 @@ fn main() -> iced::Result {
             }
         }
     }
+}
+
+/// Joins the console of the process that launched us, if there is one. This is
+/// what keeps `rmdv theme list`, `list-sections`, and the JSON replies usable
+/// from a Windows terminal in a GUI-subsystem build.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // Fails harmlessly when there is no parent console (Explorer launch) or the
+    // process already owns one (debug build).
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
 fn launch_instance(initial: Option<ipc::Request>) -> iced::Result {
