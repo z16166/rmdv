@@ -47,28 +47,14 @@ fn toolbar_setting_switches_between_hover_and_always_and_persists() {
 fn toolbar_setting_row_has_a_clickable_segmented_control() {
     let mut app = App::default();
     let _ = app.update(Message::OpenSettings);
-    let mut ui = PointerUi::new();
-    // Bring the row into view the way the keyboard does.
-    let mut at = ui.text_bounds(&app, "On hover");
-    for _ in 0..20 {
-        if at.is_some_and(|b| b.y > 40.0 && b.y + b.height < 760.0) {
-            break;
-        }
-        let _ = ui.wheel(&app, Point::new(640.0, 400.0));
-        at = ui.text_bounds(&app, "On hover");
-    }
-    let on_hover = at.expect("the Toolbar row shows an On hover segment");
+    // A window tall enough to hold every settings row: this test is about the
+    // segment's hit area, not about scrolling the list.
+    let mut ui = PointerUi::sized(Size::new(1280.0, 1200.0));
+    let on_hover = ui
+        .text_bounds(&app, "On hover")
+        .expect("the Toolbar row shows an On hover segment");
     assert!(ui.text_bounds(&app, "Always").is_some(), "and Always");
-    eprintln!(
-        "DEBUG on_hover={on_hover:?} always={:?} toolbar={:?}",
-        ui.text_bounds(&app, "Always"),
-        ui.text_bounds(&app, "Toolbar")
-    );
     let messages = ui.click(&app, center(on_hover));
-    eprintln!(
-        "DEBUG after={:?} messages={messages:?}",
-        ui.text_bounds(&app, "On hover")
-    );
     assert!(
         has(&messages, |m| matches!(
             m,
