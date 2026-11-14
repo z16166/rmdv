@@ -123,11 +123,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-26
+          - os: macos-15
             arch: arm64
             target: aarch64-apple-darwin
             pdfium_asset: pdfium-mac-arm64
-          - os: macos-26-intel
+          - os: macos-15
             arch: x86_64
             target: x86_64-apple-darwin
             pdfium_asset: pdfium-mac-x64
