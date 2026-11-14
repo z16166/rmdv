@@ -1,5 +1,13 @@
 name: Release
 
+# Builds and publishes six 64-bit archives for a `v*` tag:
+#   Windows (x86_64, arm64) — MSVC CRT linked statically (+crt-static)
+#   macOS 11.0+ (x86_64, arm64) — MACOSX_DEPLOYMENT_TARGET=11.0
+#   Linux glibc 2.28+ (x86_64, arm64) — built inside AlmaLinux 8
+#
+# Each archive holds the binary, its PDFium shared library (where PDF support
+# is built in), README.md, and LICENSE. The publish job also uploads
+# SHA256SUMS.
 on:
   push:
     tags:
@@ -7,18 +15,28 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0)'
-        required: true
+        description: 'Release tag to publish (e.g. v0.11.0). Leave empty to build artifacts only.'
+        required: false
         type: string
       dry_run:
-        description: 'Build, sign, notarize, and verify every artifact, but do not publish a release'
+        description: 'Build and verify every artifact, but do not publish a release'
         required: false
         default: true
         type: boolean
 
-# Build jobs only need to read the repo; only the publish job writes releases.
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+  # Artifact prefix and release tag. A manual run without a tag builds under
+  # `build-<sha>` and never publishes.
+  RELEASE_TAG: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag || (github.event_name == 'workflow_dispatch' && format('build-{0}', github.sha)) || github.ref_name }}"
+  # A manual run for an existing tag must build that tag, not the branch the
+  # run was started from.
+  CHECKOUT_REF: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag || github.ref }}"
 
 jobs:
   # ── Tests gate every build job, so nothing publishes from a failing commit.
@@ -26,24 +44,27 @@ jobs:
     name: Tests
     uses: ./.github/workflows/tests.yml
 
-  # ── macOS: signed + notarized .dmg and .app.tar.gz (the in-app updater
-  #    downloads the .app.tar.gz and self-replaces). Signing mirrors the
-  #    c9watch release workflow: import a Developer ID cert into a temp
-  #    keychain, codesign --options runtime, then notarize + staple.
-  build-macos:
-    name: macOS ${{ matrix.arch }}
+  # ── Windows: MSVC runtime is linked statically, so the zip needs no VC++
+  #    redistributable on Windows 10/11. Best-effort PDF support is off here,
+  #    matching `cargo check --no-default-features` in CI.
+  build-windows:
+    name: Windows ${{ matrix.arch }}
     needs: tests
-    runs-on: macos-14
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            arch: aarch64
-          - target: x86_64-apple-darwin
-            arch: x86_64
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -53,428 +74,291 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+          key: release-${{ matrix.target }}
 
       - name: Build release
-        run: cargo build --release --features pdf --target ${{ matrix.target }}
+        run: cargo build --release --no-default-features --target ${{ matrix.target }}
 
-      - name: Package (.app bundle)
-        run: cargo packager --release --target ${{ matrix.target }} -f app
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch == 'arm64' && 'arm64' || 'amd64' }}
 
-      - name: Embed PDFium dylib (pdf feature)
-        shell: bash
+      - name: Verify static MSVC runtime
+        shell: pwsh
         run: |
-          set -euo pipefail
-          APP="target/${{ matrix.target }}/release/rmdv.app"
-          # liteparse's build script downloads libpdfium.dylib into the build
-          # tree. It is loaded at runtime via dlopen from next to the executable
-          # (current_exe dir), so it must live inside Contents/MacOS. The
-          # subsequent codesign --deep --options runtime step seals + hardens it.
-          DYLIB=$(find "target/${{ matrix.target }}/release" -name libpdfium.dylib | head -1)
-          if [ -z "$DYLIB" ]; then DYLIB=$(find target -name libpdfium.dylib | head -1); fi
-          if [ -z "$DYLIB" ]; then
-            # A warm rust-cache skips the build script, so neither the download
-            # nor the copy into target/ happens. Fetch the same pinned pdfium
-            # release the build script uses, with the same install-name fix.
-            SYS=$(ls -d "$HOME"/.cargo/registry/src/*/liteparse-pdfium-sys-* | sort -V | tail -1)
-            PDFIUM_TAG=$(sed -n 's/^const PDFIUM_RELEASE_TAG: &str = "\(.*\)";$/\1/p' "$SYS/build.rs")
-            case "${{ matrix.arch }}" in
-              aarch64) ASSET=pdfium-mac-arm64 ;;
-              x86_64) ASSET=pdfium-mac-x64 ;;
-            esac
-            if [ -z "$PDFIUM_TAG" ] || [ -z "${ASSET:-}" ]; then
-              echo "libpdfium.dylib not found and pdfium release unknown"; exit 1
-            fi
-            PDFIUM_DIR="$RUNNER_TEMP/pdfium"
-            mkdir -p "$PDFIUM_DIR"
-            curl -fsSL "https://github.com/run-llama/pdfium-binaries/releases/download/${PDFIUM_TAG//\//%2F}/$ASSET.tgz" \
-              | tar -xz -C "$PDFIUM_DIR"
-            DYLIB="$PDFIUM_DIR/lib/libpdfium.dylib"
-            install_name_tool -id @rpath/libpdfium.dylib "$DYLIB"
-            echo "Fetched pdfium $PDFIUM_TAG ($ASSET) because the build tree had no copy"
-          fi
-          if [ ! -s "$DYLIB" ]; then echo "libpdfium.dylib not found"; exit 1; fi
-          cp "$DYLIB" "$APP/Contents/MacOS/libpdfium.dylib"
-          echo "Embedded $DYLIB -> $APP/Contents/MacOS/"
+          $exe = "target/${{ matrix.target }}/release/rmdv.exe"
+          if (!(Test-Path $exe)) { throw "missing $exe" }
+          $imports = & dumpbin /nologo /dependents $exe
+          $imports
+          $dynamic = $imports | Select-String -Pattern 'VCRUNTIME|MSVCP|MSVCR|api-ms-win-crt'
+          if ($dynamic) { throw "dynamic MSVC runtime import: $dynamic" }
+          Write-Host "OK: MSVC runtime is statically linked"
 
-      - name: Import signing certificate
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      - name: Package zip
+        shell: pwsh
         run: |
-          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "No APPLE_CERTIFICATE secret set; skipping import (ad-hoc sign later)."
-            exit 0
-          fi
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
-          security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-          rm -f $RUNNER_TEMP/certificate.p12
+          $stage = "dist/rmdv-$env:RELEASE_TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rmdv.exe" $stage
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
 
-      - name: Sign, notarize, and stage artifacts
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          ARCH: ${{ matrix.arch }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUT="target/${{ matrix.target }}/release"
-          APP="$OUT/rmdv.app"
-          mkdir -p dist
-
-          # A published release must be Developer ID signed. Only a dry run may
-          # fall back to an ad-hoc signature.
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ] && [ "$DRY_RUN" != "true" ]; then
-            echo "::error::APPLE_SIGNING_IDENTITY is not set; refusing to publish unsigned macOS artifacts"
-            exit 1
-          fi
-
-          # cargo-packager produces an ad-hoc signed .app. Re-sign with the
-          # Developer ID, notarize, and staple the bundle. (Packager's own dmg
-          # step rebuilds + re-adhoc-signs the app, so we build the dmg by hand
-          # below to keep the Developer ID signature intact.)
-          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            # Sign the embedded PDFium dylib first (hardened runtime + timestamp),
-            # then sign the app deep. The dylib is dlopen'd at runtime and must
-            # carry its own valid Developer ID signature + runtime flag for
-            # notarization to accept the bundle.
-            if [ -f "$APP/Contents/MacOS/libpdfium.dylib" ]; then
-              codesign --force --options runtime --timestamp \
-                --sign "$APPLE_SIGNING_IDENTITY" "$APP/Contents/MacOS/libpdfium.dylib"
-            fi
-            codesign --force --deep --options runtime \
-              --sign "$APPLE_SIGNING_IDENTITY" "$APP"
-            # Notarize the .app (zipped for submission), then staple the bundle.
-            ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/rmdv-notarize.zip"
-            xcrun notarytool submit "$RUNNER_TEMP/rmdv-notarize.zip" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait
-            xcrun stapler staple "$APP"
-            codesign --verify --deep --strict --verbose=2 "$APP"
-            xcrun stapler validate "$APP"
-            spctl --assess --type execute --verbose=2 "$APP"
-          else
-            # No cert configured: ad-hoc sign so the bundle is at least sealed.
-            codesign --force --deep --options runtime --sign - "$APP" || true
-          fi
-
-          # The updater payload: a tarball of the signed (+ stapled) .app.
-          tar -C "$OUT" -czf "dist/rmdv_${TAG}_${ARCH}.app.tar.gz" rmdv.app
-
-          # Build the dmg by hand from the signed app. This persists a Finder
-          # background, icon positions, and drag-to-Applications layout in
-          # the image before compression; cargo-packager's dmg path would not.
-          bash scripts/create-macos-dmg.sh \
-            "$APP" \
-            "dist/rmdv_${TAG}_${ARCH}.dmg" \
-            "assets/dmg-background-terminal.png"
-          # Sign, notarize, and staple the dmg container too, so the
-          # downloaded installer is clean. Every step fails the job.
-          DMG="dist/rmdv_${TAG}_${ARCH}.dmg"
-          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
-            xcrun notarytool submit "$DMG" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait
-            xcrun stapler staple "$DMG"
-            codesign --verify --strict --verbose=2 "$DMG"
-            xcrun stapler validate "$DMG"
-            spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
-          fi
-          for f in "$DMG" "dist/rmdv_${TAG}_${ARCH}.app.tar.gz"; do
-            [ -s "$f" ] || { echo "::error::missing or empty artifact: $f"; exit 1; }
-          done
-
-      - name: Upload macOS artifacts
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
-          path: dist/*
+          name: windows-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
 
-  # ── Linux: AppImage (the in-app updater swaps the single AppImage file).
-  build-linux:
-    name: Linux x86_64
+  # ── macOS: both slices are built on the arm64 runner (the Intel slice is a
+  #    cross build). PDF support is on; libpdfium.dylib is shipped next to the
+  #    binary because it is dlopen'd at runtime. Ad-hoc signing keeps arm64
+  #    binaries launchable without a Developer ID certificate.
+  build-macos:
+    name: macOS ${{ matrix.arch }}
     needs: tests
-    runs-on: ubuntu-latest
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            pdfium_asset: pdfium-mac-arm64
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            pdfium_asset: pdfium-mac-x64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-unknown-linux-gnu
-
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libssl-dev pkg-config fuse libfuse2 file desktop-file-utils
+          key: release-${{ matrix.target }}
 
       - name: Build release
-        # PDF support is on (default feature). PDFium's libpdfium.so is
-        # dlopen'd at runtime from next to the binary; the AppImage step below
-        # copies it into usr/bin alongside rmdv. (Windows still opts out.)
-        run: |
-          # The cargo cache can restore the binary without the PDFium runtime
-          # library because liteparse's build-script output is not cached.
-          # Clean this target so the build script refreshes target/*/deps.
-          cargo clean --target x86_64-unknown-linux-gnu
-          cargo build --release --target x86_64-unknown-linux-gnu
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build AppImage
-        env:
-          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Package tar.gz
+        shell: bash
         run: |
           set -euo pipefail
-          BIN=target/x86_64-unknown-linux-gnu/release/rmdv
-          APPDIR=rmdv.AppDir
-          rm -rf "$APPDIR"
-          mkdir -p "$APPDIR/usr/bin"
-          cp "$BIN" "$APPDIR/usr/bin/rmdv"
-          # PDFium .so must sit next to the binary (dlopen searches current_exe
-          # dir). liteparse's build script normally copies it into the build
-          # tree, but its source cache is the authoritative fallback when that
-          # best-effort copy is absent.
-          PDFIUM_CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/pdfium-rs"
-          SO=""
-          if [ -d target/x86_64-unknown-linux-gnu/release ]; then
-            SO=$(find target/x86_64-unknown-linux-gnu/release -name 'libpdfium.so' -type f -print -quit)
+          OUT="target/${{ matrix.target }}/release"
+          NAME="rmdv-${RELEASE_TAG}-${{ matrix.target }}"
+          STAGE="dist/$NAME"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp "$OUT/rmdv" "$STAGE/rmdv"
+
+          # PDFium is dlopen'd from next to the binary. A warm rust-cache can
+          # skip the liteparse build script that normally copies it into
+          # target/, so fetch the same pinned asset as a fallback.
+          DYLIB=$(find "$OUT" target -name libpdfium.dylib -type f -print -quit 2>/dev/null || true)
+          if [ -z "$DYLIB" ]; then
+            SYS=$(ls -d "$HOME"/.cargo/registry/src/*/liteparse-pdfium-sys-* | sort -V | tail -1)
+            PDFIUM_TAG=$(sed -n 's/^const PDFIUM_RELEASE_TAG: &str = "\(.*\)";$/\1/p' "$SYS/build.rs")
+            if [ -z "$PDFIUM_TAG" ]; then
+              echo "::error::cannot resolve the pinned PDFium release"
+              exit 1
+            fi
+            TMP="$RUNNER_TEMP/pdfium"
+            rm -rf "$TMP"
+            mkdir -p "$TMP"
+            curl -fsSL "https://github.com/run-llama/pdfium-binaries/releases/download/${PDFIUM_TAG//\//%2F}/${{ matrix.pdfium_asset }}.tgz" \
+              | tar -xz -C "$TMP"
+            DYLIB="$TMP/lib/libpdfium.dylib"
           fi
-          if [ -z "$SO" ] && [ -d target ]; then
-            SO=$(find target -name 'libpdfium.so' -type f -print -quit)
-          fi
-          if [ -z "$SO" ] && [ -d "$PDFIUM_CACHE_ROOT" ]; then
-            SO=$(find "$PDFIUM_CACHE_ROOT" -name 'libpdfium.so' -type f -print -quit)
-          fi
-          if [ -z "$SO" ]; then
-            echo "libpdfium.so not found; searched target/x86_64-unknown-linux-gnu/release, target, and $PDFIUM_CACHE_ROOT" >&2
+          if [ ! -s "$DYLIB" ]; then
+            echo "::error::libpdfium.dylib not found"
             exit 1
           fi
-          echo "Selected PDFium: $SO"
-          cp "$SO" "$APPDIR/usr/bin/libpdfium.so"
-          echo "Embedded $SO -> $APPDIR/usr/bin/"
-          cp assets/icon.png "$APPDIR/rmdv.png"
-          cat > "$APPDIR/rmdv.desktop" <<'DESKTOP'
-          [Desktop Entry]
-          Name=rmdv
-          Exec=rmdv
-          Icon=rmdv
-          Type=Application
-          Categories=Utility;
-          DESKTOP
-          cat > "$APPDIR/AppRun" <<'APPRUN'
-          #!/bin/sh
-          HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/rmdv" "$@"
-          APPRUN
-          chmod +x "$APPDIR/AppRun"
+          cp "$DYLIB" "$STAGE/libpdfium.dylib"
 
-          # AppImageKit is archived, so its "continuous" asset is frozen —
-          # pin its hash so a hijacked asset can't slip a build tool in.
-          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-          echo "b90f4a8b18967545fda78a445b27680a1642f1ef9488ced28b65398f2be7add2  appimagetool-x86_64.AppImage" | sha256sum -c -
-          chmod +x appimagetool-x86_64.AppImage
-          ./appimagetool-x86_64.AppImage --appimage-extract >/dev/null
+          cp README.md LICENSE "$STAGE/"
+
+          # arm64 macOS refuses to execute unsigned code; ad-hoc signatures are
+          # enough for a locally extracted build.
+          codesign --force --sign - "$STAGE/libpdfium.dylib"
+          codesign --force --sign - "$STAGE/rmdv"
+
+          MINOS=$(otool -l "$STAGE/rmdv" | awk '/minos /{print $2; exit}')
+          echo "macOS deployment target: ${MINOS:-unknown}"
+          if [ -z "$MINOS" ]; then
+            echo "::error::cannot read the binary's LC_BUILD_VERSION minos"
+            exit 1
+          fi
+          if [ "$(printf '%s\n11.0\n' "$MINOS" | sort -V | head -1)" != "11.0" ]; then
+            echo "::error::binary targets macOS $MINOS, expected 11.0 or newer"
+            exit 1
+          fi
+
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── Linux: built inside AlmaLinux 8 (glibc 2.28) rather than on the Ubuntu
+  #    runner, whose newer glibc would silently raise the binary's floor. The
+  #    arm64 job runs natively on the arm64 runner and pulls the arm64 image.
+  build-linux:
+    name: Linux ${{ matrix.arch }}
+    needs: tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Build in AlmaLinux 8 (glibc 2.28)
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(pwd)"
           mkdir -p dist
-          ARCH=x86_64 ./squashfs-root/AppRun "$APPDIR" "dist/rmdv-${TAG}-x86_64.AppImage"
+          docker run --rm \
+            --platform "$PLATFORM" \
+            -v "$WORKSPACE:/workspace" \
+            -w /workspace \
+            -e TARGET="$TARGET" \
+            -e TAG="$RELEASE_TAG" \
+            almalinux:8 bash -c '
+              set -euo pipefail
+              dnf install -y --setopt=install_weak_deps=False \
+                gcc gcc-c++ make cmake pkgconf-pkg-config \
+                gtk3-devel libxkbcommon-devel wayland-devel \
+                ca-certificates curl-minimal perl tar gzip findutils
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+              sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+              . "$HOME/.cargo/env"
+              cargo build --release --target "$TARGET"
+
+              STAGE="dist/rmdv-$TAG-$TARGET"
+              rm -rf "$STAGE"
+              mkdir -p "$STAGE"
+              cp "target/$TARGET/release/rmdv" "$STAGE/rmdv"
+
+              # PDFium is loaded from next to the binary at runtime; pick it up
+              # from the build tree or the download cache.
+              SO=""
+              for dir in "target/$TARGET/release" "target" "$HOME/.cache/pdfium-rs"; do
+                [ -d "$dir" ] || continue
+                SO=$(find "$dir" -name libpdfium.so -type f -print -quit)
+                [ -n "$SO" ] && break
+              done
+              if [ -n "$SO" ]; then
+                cp "$SO" "$STAGE/libpdfium.so"
+              else
+                echo "::warning::libpdfium.so not found; archive ships without PDF support"
+              fi
+              cp README.md LICENSE "$STAGE/"
+
+              MAX_GLIBC=$(objdump -T "$STAGE/rmdv" | grep -o "GLIBC_[0-9.]*" | sort -Vu | tail -1)
+              echo "highest GLIBC symbol requirement: ${MAX_GLIBC:-none}"
+              if [ -n "$MAX_GLIBC" ] && [ "$(printf "%s\nGLIBC_2.28\n" "$MAX_GLIBC" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+                echo "::error::binary requires $MAX_GLIBC, above the glibc 2.28 floor"
+                exit 1
+              fi
+
+              tar -czf "dist/rmdv-$TAG-$TARGET.tar.gz" -C dist "rmdv-$TAG-$TARGET"
+            '
+          sudo chown -R "$(id -u):$(id -g)" "$WORKSPACE/target" "$WORKSPACE/dist"
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64
-          path: dist/*
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
 
-  # ── Windows: NSIS installer (no in-app updater on Windows). Best-effort —
-  #    Windows is out of the mac+linux release scope and must not block the
-  #    publish job, so a build failure here is tolerated.
-  build-windows:
-    name: Windows x86_64
-    needs: tests
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: x86_64-pc-windows-msvc
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
-      - name: Build release
-        # PDF support is macOS-only for now (see Linux note); build without it.
-        run: cargo build --release --no-default-features --target x86_64-pc-windows-msvc
-      - name: Package
-        run: cargo packager --release --target x86_64-pc-windows-msvc -f nsis
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86_64
-          path: |
-            target/x86_64-pc-windows-msvc/release/*.exe
-            target/x86_64-pc-windows-msvc/release/*-setup.exe
-          if-no-files-found: warn
-
-  # ── Assemble checksums + updater manifest, publish the GitHub release.
+  # ── Publish: fail closed unless all six archives exist, then upload them
+  #    with SHA256SUMS. Manual runs publish only with an explicit tag and
+  #    `dry_run: false`.
   release:
     name: Publish release
-    needs: [build-macos, build-linux, build-windows]
+    needs: [build-windows, build-macos, build-linux]
+    if: "startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.dry_run == 'false')"
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: out
+          merge-multiple: true
 
-      - name: Resolve tag
-        id: tag
+      - name: Verify artifacts and write checksums
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Release notes come from docs/releases/<tag>-release-notes.md when that
-      # file exists (format: docs/releases/TEMPLATE.md); otherwise GitHub
-      # generates them.
-      - name: Check out release notes
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
-          sparse-checkout: docs/releases
-          path: notes-src
+          set -euo pipefail
+          cd out
+          ls -l
+          expected=(
+            "rmdv-${RELEASE_TAG}-x86_64-pc-windows-msvc.zip"
+            "rmdv-${RELEASE_TAG}-aarch64-pc-windows-msvc.zip"
+            "rmdv-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz"
+            "rmdv-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz"
+            "rmdv-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+            "rmdv-${RELEASE_TAG}-aarch64-unknown-linux-gnu.tar.gz"
+          )
+          for f in "${expected[@]}"; do
+            [ -s "$f" ] || { echo "::error::missing or empty artifact: $f"; exit 1; }
+          done
+          sha256sum * > SHA256SUMS
+          sha256sum -c SHA256SUMS
 
       - name: Pick release notes
         id: notes
         shell: bash
         run: |
-          FILE="notes-src/docs/releases/${{ steps.tag.outputs.tag }}-release-notes.md"
+          FILE="docs/releases/${RELEASE_TAG}-release-notes.md"
           if [ -f "$FILE" ]; then
             echo "path=$FILE" >> "$GITHUB_OUTPUT"
           else
             echo "path=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Collect artifacts + checksums + manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.tag.outputs.tag }}"
-          VERSION="${TAG#v}"
-          mkdir -p out
-          find artifacts -type f \
-            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.AppImage' \
-               -o -name '*.exe' \) -exec cp {} out/ \;
-
-          cd out
-          # Fail closed: every required macOS and Linux artifact exists and is
-          # non-empty. Windows stays best-effort: it may be absent, but when any
-          # Windows executable was uploaded, both the app and the setup
-          # executable must be present and non-empty.
-          require() {
-            [ -s "$1" ] || { echo "::error::missing or empty artifact: $1"; exit 1; }
-          }
-          for arch in aarch64 x86_64; do
-            require "rmdv_${TAG}_${arch}.dmg"
-            require "rmdv_${TAG}_${arch}.app.tar.gz"
-          done
-          require "rmdv-${TAG}-x86_64.AppImage"
-          shopt -s nullglob
-          exes=(*.exe)
-          setups=(*-setup.exe)
-          if [ "${#exes[@]}" -gt 0 ]; then
-            for f in "${exes[@]}"; do require "$f"; done
-            [ "${#setups[@]}" -gt 0 ] || { echo "::error::Windows app executable without a setup executable"; exit 1; }
-            [ "${#exes[@]}" -gt "${#setups[@]}" ] || { echo "::error::Windows setup executable without an app executable"; exit 1; }
-          else
-            echo "::warning::No Windows executables (best-effort job); publishing macOS and Linux only"
-          fi
-          shopt -u nullglob
-
-          # SHA256SUMS over every published artifact.
-          sha256sum * > SHA256SUMS
-          sha256sum -c SHA256SUMS
-
-          # Per-platform sha for the updater manifest.
-          sha_of() { sha256sum "$1" | cut -d' ' -f1; }
-          AARCH64="rmdv_${TAG}_aarch64.app.tar.gz"
-          X86_64="rmdv_${TAG}_x86_64.app.tar.gz"
-          LINUX="rmdv-${TAG}-x86_64.AppImage"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          NOTES="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
-
-          cat > latest.json <<MANIFEST
-          {
-            "version": "${VERSION}",
-            "notes_url": "${NOTES}",
-            "platforms": {
-              "darwin-aarch64": { "url": "${BASE}/${AARCH64}", "sha256": "$(sha_of "$AARCH64")" },
-              "darwin-x86_64":  { "url": "${BASE}/${X86_64}",  "sha256": "$(sha_of "$X86_64")" },
-              "linux-x86_64":   { "url": "${BASE}/${LINUX}",   "sha256": "$(sha_of "$LINUX")" }
-            }
-          }
-          MANIFEST
-          cat latest.json
-          # The manifest must parse and point at the artifacts above.
-          python3 - "$AARCH64" "$X86_64" "$LINUX" <<'PY'
-          import hashlib, json, sys
-          m = json.load(open("latest.json"))
-          for (key, name) in zip(("darwin-aarch64", "darwin-x86_64", "linux-x86_64"), sys.argv[1:]):
-              entry = m["platforms"][key]
-              digest = hashlib.sha256(open(name, "rb").read()).hexdigest()
-              assert entry["url"].endswith("/" + name), (key, entry["url"])
-              assert entry["sha256"] == digest, (key, entry["sha256"], digest)
-          print("latest.json verified")
-          PY
-
-      - name: Dry run summary
-        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
-        shell: bash
-        run: |
-          echo "Dry run: every artifact verified; no release published."
-          ls -la out
-
       - name: Create release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.path == '' }}
           files: |
-            out/*.dmg
-            out/*.app.tar.gz
-            out/*.AppImage
-            out/*.exe
+            out/*.zip
+            out/*.tar.gz
             out/SHA256SUMS
-            out/latest.json
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
