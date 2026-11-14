@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to publish (e.g. v0.11.0). Leave empty to build artifacts only.'
+        description: 'Release tag to publish (e.g. v0.11.0). Leave empty to publish a build-<run> pre-release when dry_run is off.'
         required: false
         type: string
       dry_run:
@@ -31,9 +31,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   MACOSX_DEPLOYMENT_TARGET: '11.0'
-  # Artifact prefix and release tag. A manual run without a tag builds under
-  # `build-<sha>` and never publishes.
-  RELEASE_TAG: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag || (github.event_name == 'workflow_dispatch' && format('build-{0}', github.sha)) || github.ref_name }}"
+  # Artifact prefix and release tag. A manual run without a tag publishes a
+  # `build-<run>` pre-release when dry_run is off.
+  RELEASE_TAG: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag || (github.event_name == 'workflow_dispatch' && format('build-{0}', github.run_number)) || github.ref_name }}"
   # A manual run for an existing tag must build that tag, not the branch the
   # run was started from.
   CHECKOUT_REF: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag || github.ref }}"
@@ -302,12 +302,12 @@ jobs:
           if-no-files-found: error
 
   # ── Publish: fail closed unless all six archives exist, then upload them
-  #    with SHA256SUMS. Manual runs publish only with an explicit tag and
-  #    `dry_run: false`.
+  #    with SHA256SUMS. A manual run publishes whenever `dry_run` is off;
+  #    without a tag input it becomes a `build-<run>` pre-release.
   release:
     name: Publish release
     needs: [build-windows, build-macos, build-linux]
-    if: "startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.dry_run == 'false')"
+    if: "startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -359,6 +359,7 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.path == '' }}
           files: |
